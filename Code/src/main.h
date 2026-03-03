@@ -81,7 +81,16 @@ Ticker updateWSTimer;
 bool sendWSFlag = false;
 
 /** a WiFi client beeing used by the MQTT client */
-WiFiClient *aWifiClient = nullptr;
+// WiFiClient *aWifiClient = nullptr; ALT
+Client *aWifiClient = nullptr;
+#if defined(ESP8266)
+#include <WiFiClientSecureBearSSL.h>
+extern BearSSL::WiFiClientSecure *tlsClient;
+extern BearSSL::X509List *tlsCa;
+#endif
+
+
+
 /** a MQTT client */
 PubSubClient *mqttClient = nullptr;
 /**  */

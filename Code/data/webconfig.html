@@ -30,7 +30,7 @@
 			<a href="config.html">SPA-Konfiguration</a>
 			<a href="webconfig.html" class="active">Web-Konfiguration</a>
 			<a href="wifi.html">Netzwerkkonfiguration</a>
-			<a href="mqtt.html">MQTT-Konfiguration</a>
+			<a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
 			<a href="/restart/">SmartAndRelax Modul neu starten<a>
 		</div>
 
@@ -64,7 +64,29 @@
 					<td>Verwende Selektor (anstatt Schieberegler)</td>
 					<td><label class="switch"><input type="checkbox" id="useControlSelector"><span class="slider round"></span></label></td>
 				</tr>
+			
+				
+                <tr>
+                    <td colspan="2" style="padding-top:25px;">
+                        <hr style="border:0;border-top:1px solid #ccc;margin:10px 0;">
+                        <div style="font-weight:bold;padding:5px 0 10px 0;">Verbindung</div>
+                    </td>
+                </tr>
+
+                <tr>
+                    <td>Bei Lade- oder Verbindungsproblemen diese Option aktivieren</td>
+					<td><label class="switch"><input type="checkbox" id="usePolling"><span class="slider round"></span></label></td>
+				</tr>
+
 			</table>
+
+			<div style="padding:8px 2px;font-size:0.9em;opacity:0.85;">
+				Wenn das Dashboard nicht richtig lädt oder keine Daten angezeigt werden, aktiviere diese Einstellung.
+				Dadurch wird eine stabilere Verbindung verwendet.
+				Dieses Problem tritt häufiger im Safari-Browser auf.
+				Die Einstellung gilt nur für diesen Browser. Nach dem Speichern bitte das Dashboard neu laden.
+			</div>
+
 		</section>
 
 		<footer class="center">
@@ -165,6 +187,7 @@ function setWebConfig()
 	document.getElementById('showSectionTimer').checked = (localStorage.getItem('showSectionTimer') === 'true');
 	document.getElementById('showSectionTotals').checked = (localStorage.getItem('showSectionTotals') === 'true');
 	document.getElementById('useControlSelector').checked = (localStorage.getItem('useControlSelector') === 'true');
+	document.getElementById('usePolling').checked = (localStorage.getItem('usePolling') === 'true');
 }
 
 function saveWebConfig()
@@ -176,6 +199,7 @@ function saveWebConfig()
 	localStorage.setItem('showSectionTimer', document.getElementById('showSectionTimer').checked);
 	localStorage.setItem('showSectionTotals', document.getElementById('showSectionTotals').checked);
 	localStorage.setItem('useControlSelector', document.getElementById('useControlSelector').checked);
+	localStorage.setItem('usePolling', document.getElementById('usePolling').checked);
 	writeWebConfig();
 }
 

@@ -1,4 +1,714 @@
 #include "main.h"
+#include "mqtt_ca.h"
+
+
+// --- Boot diagnostics (shown in Web UI at /diag) ---
+static String g_boot_diag;
+static uint32_t g_boot_millis = 0;
+
+static String htmlEscape(const String& in) {
+    String out;
+    out.reserve(in.length() + 16);
+    for (size_t i = 0; i < in.length(); i++) {
+        const char c = in[i];
+        switch (c) {
+            case '&': out += F("&amp;"); break;
+            case '<': out += F("&lt;"); break;
+            case '>': out += F("&gt;"); break;
+            case '"': out += F("&quot;"); break;
+            default:  out += c; break;
+        }
+    }
+    return out;
+}
+
+
+// --- Restart marker (persisted for Web UI diagnostics) ---
+static const char* kRestartMarkerPath = "/last_restart_marker.txt";
+static String g_last_restart_marker_boot;
+
+static void writeRestartMarker(const String& reason) {
+    // Best effort: LittleFS should be mounted already. If not, this silently fails.
+    File f = LittleFS.open(kRestartMarkerPath, "w");
+    if (!f) return;
+
+    // Include both millis() and time if available (NTP), but don't depend on it.
+    f.print("Reason: ");
+    f.println(reason);
+
+    f.print("Millis: ");
+    f.println(millis());
+
+    time_t nowt = time(nullptr);
+    if (nowt > 100000) {
+        struct tm* tm_info = localtime(&nowt);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+        f.print("Time: ");
+        f.println(buf);
+    }
+
+    f.close();
+}
+
+static void loadRestartMarkerBoot() {
+    File f = LittleFS.open(kRestartMarkerPath, "r");
+    if (!f) return;
+    g_last_restart_marker_boot = f.readString();
+    f.close();
+}
+
+static void requestRestart(const char* reason) {
+    // Reason might be null; keep it safe.
+    String r = reason ? String(reason) : String("unknown");
+    writeRestartMarker(r);
+    delay(50);
+    ESP.restart();
+}
+
+
+
+#if defined(ESP8266)
+ #include <bearssl/bearssl.h>   // <-- DAS HINZUFÜGEN (für SHA256)
+
+ // ------------------------------
+ // Crash-Fix: statische TLS/MQTT Objekte (kein new/delete)
+ // ------------------------------
+ static BearSSL::WiFiClientSecure tlsClientStatic;
+ static BearSSL::X509List         tlsCaStatic(SAR_MQTT_CA_CERT);
+
+ // Legacy Pointer-Aliase (damit der restliche Code unverändert bleibt)
+ BearSSL::WiFiClientSecure *tlsClient = &tlsClientStatic;
+ BearSSL::X509List *tlsCa = &tlsCaStatic;
+#endif
+
+// Statischer MQTT-Client (auf TLS) – Pointer mqttClient bleibt kompatibel
+#if defined(ESP8266)
+ static PubSubClient mqttClientStatic(tlsClientStatic);
+#else
+ static WiFiClient   wifiClientStatic;
+ static PubSubClient mqttClientStatic(wifiClientStatic);
+#endif
+
+
+
+
+static String getMacClean()
+{
+    String mac = WiFi.macAddress();   // "AA:BB:CC:DD:EE:FF"
+    mac.replace(":", "");
+    mac.replace("-", "");
+    mac.toUpperCase();
+    return mac;
+}
+
+static bool timeLooksValid() {
+  time_t now = time(nullptr);
+  return (now > 1700000000); // grob: >= 2023
+}
+
+static void waitForValidTime(uint32_t maxWaitMs = 8000) {
+  uint32_t t0 = millis();
+  while (!timeLooksValid() && (millis() - t0) < maxWaitMs) {
+    delay(10);
+    yield();
+  }
+}
+
+
+// --------------------
+// Cloud Presence Gate (Recommended)
+// --------------------
+static const uint32_t PRESENCE_POLL_OFFLINE_MS  = 3UL * 60UL * 1000UL;  // 3 Minuten
+static const uint32_t PRESENCE_POLL_BURST_MS = 20000UL; // 20 Sekunden
+static const uint32_t PRESENCE_POLL_ONLINE_MS = 60000UL; // 60 Sekunden
+static const uint32_t PRESENCE_ACTIVE_WINDOW_MS = 3UL  * 60UL * 1000UL;  // 3 Minuten
+static const uint32_t PRESENCE_GRACE_MS         = 45UL * 1000UL;         // 45 Sekunden
+
+// -------- Presence Debug --------
+// NUR auf true setzen, wenn du aktiv debuggen willst
+static const bool PRESENCE_DEBUG = true;
+
+
+
+
+
+static const char* PRESENCE_HOST = "europe-west3-smartandrelax-cloud.cloudfunctions.net";
+static const uint16_t PRESENCE_PORT = 443;
+static const char* PRESENCE_PATH_PREFIX = "/presence?deviceId=";
+
+static uint32_t presence_active_until_ms = 0;
+
+// Cloud Functions Host (NICHT setInsecure!)
+#if defined(ESP8266)
+static BearSSL::WiFiClientSecure presenceClient;
+static BearSSL::X509List* presenceCa = nullptr;
+static BearSSL::Session presenceSession;
+
+
+
+
+
+
+
+static bool presenceTlsReady = false;
+
+static void initPresenceTlsOnce()
+{
+  if (presenceTlsReady) return;
+
+  if (!presenceCa) {
+    presenceCa = new BearSSL::X509List(PRESENCE_ROOT_CA);
+  }
+
+  presenceClient.setTrustAnchors(presenceCa);   // nur 1x!
+  presenceClient.setSession(&presenceSession);  // ✅ enables session resumption
+  presenceClient.setBufferSizes(512, 512);
+  presenceClient.setTimeout(5);
+
+  // TLS braucht gültige Zeit
+  waitForValidTime(8000);
+  presenceClient.setX509Time(time(nullptr));
+
+  presenceTlsReady = true;
+}
+
+
+#endif
+
+
+
+static uint32_t presence_next_poll_ms = 0;
+static uint32_t presence_grace_until_ms = 0;
+static bool     presence_allowed = false;
+
+// --- Pairing Bootstrap: MQTT kurz erlauben nach Pairing-Code Save ---
+static uint32_t cloud_pair_bootstrap_until_ms = 0;
+static uint32_t cloud_next_mqtt_try_ms = 0;   // <--- NEU
+
+#if defined(ESP8266)
+// --- MQTT Recovery / Health counters ---
+static uint32_t mqtt_last_connected_ms = 0;
+static uint32_t mqtt_last_attempt_ms   = 0;
+static uint8_t  mqtt_fail_streak       = 0;
+static uint32_t mqtt_stack_reset_ms    = 0;
+#endif
+
+
+static inline bool cloudBootstrapActive()
+{
+  return (int32_t)(cloud_pair_bootstrap_until_ms - millis()) > 0;
+}
+
+
+// --- Presence Poll Jitter (gegen Lastspitzen) ---
+static uint32_t addJitter(uint32_t baseMs) {
+  // ±10% Jitter
+  int32_t j = (int32_t)(baseMs / 10);
+  int32_t r = (int32_t)random(-j, j + 1);
+  int32_t out = (int32_t)baseMs + r;
+  if (out < 1000) out = 1000; // nie unter 1s
+  return (uint32_t)out;
+}
+
+// --- Presence Keep-Alive Connection Management ---
+static uint32_t presence_last_use_ms = 0;
+static uint32_t presence_conn_open_ms = 0;
+
+// wie lange darf eine TLS/TCP Verbindung maximal offen bleiben (Anti-Leak / Anti-Hang)
+static const uint32_t PRESENCE_CONN_MAX_AGE_MS  = 120000UL;  // 2 Minuten
+
+// wenn so lange nicht benutzt -> schließen (Server könnte sowieso droppen)
+static const uint32_t PRESENCE_CONN_IDLE_CLOSE_MS = 30000UL; // 30 Sekunden
+
+
+// Harte Bremse: wenn MQTT connected, Polling pausieren bis Disconnect
+static bool presence_polling_paused = false;
+
+// Cloud Telemetry scheduling (wie vorher, aber ohne Duty Window)
+static uint32_t sar_cloud_next_telemetry_ms = 0;
+
+static inline bool isPaired()
+{
+    String code = mqttPairingCode;
+    code.trim();
+    return code.length() >= 4; // gleiche Logik wie publishPairingHash()
+}
+
+static inline bool cloudPollingEnabled()
+{
+    // Presence-Polling muss IMMER laufen, unabhängig von MQTT enable/pairing.
+    // MQTT folgt später der Presence-Entscheidung.
+    return mqttCloudMode && (WiFi.status() == WL_CONNECTED);
+}
+
+
+
+
+
+// Minimaler HTTPS GET der 1 Byte ("1" oder "0") liefert.
+// Returns: true wenn request erfolgreich (Response gelesen), false bei Fehlern (Timeout etc.)
+static bool cloudPresenceFetch(bool &outAllowed)
+{
+#if !defined(ESP8266)
+    (void)outAllowed;
+    return false;
+#else
+    initPresenceTlsOnce();
+
+        // --- PATCH: keep MQTT alive while waiting for HTTPS response ---
+    auto pumpBackground = [&]() {
+      if (mqttClient) mqttClient->loop();  // wichtig: MQTT weiter bedienen
+      delay(0);
+      yield();
+    };
+
+
+    // Optional: wenn Heap sehr niedrig ist, lieber fail-closed (verhindert Reboots)
+if (ESP.getFreeHeap() < 12000 || ESP.getMaxFreeBlockSize() < 6000) {
+  return false;
+}
+
+
+String devId = getMacClean();
+String urlPath = String(PRESENCE_PATH_PREFIX) + devId;
+
+if (PRESENCE_DEBUG) {
+  Serial.printf_P(PSTR("PRESENCE REQ: https://%s%s (deviceId=%s)\n"),
+                  PRESENCE_HOST, urlPath.c_str(), devId.c_str());
+}
+
+// --- Always fresh connect (no keep-alive) ---
+if (presenceClient.connected()) {
+  presenceClient.stop();
+  yield();
+}
+
+if (!presenceClient.connect(PRESENCE_HOST, PRESENCE_PORT)) {
+  char err[128];
+  presenceClient.getLastSSLError(err, sizeof(err));
+  if (PRESENCE_DEBUG) {
+    Serial.printf_P(PSTR("PRESENCE TLS connect FAIL: %s\n"), err);
+  }
+  return false;
+}
+
+
+
+    // HTTP Request
+presenceClient.print(
+    String("GET ") + urlPath + " HTTP/1.1\r\n" +
+    "Host: " + String(PRESENCE_HOST) + "\r\n" +
+    "User-Agent: esp8266\r\n" +
+    "Accept: text/plain\r\n" +
+    "Connection: close\r\n\r\n"
+
+);
+presenceClient.flush(); // sicherstellen, dass Request raus ist
+
+
+
+// --- Warten bis Response-Bytes da sind (sonst kommt statusLine manchmal leer) ---
+uint32_t t_wait = millis();
+while (presenceClient.connected() && !presenceClient.available() && (millis() - t_wait) < 800) {
+    pumpBackground();
+}
+
+
+// Statusline lesen (mit Guard)
+String statusLine;
+if (presenceClient.available()) {
+    statusLine = presenceClient.readStringUntil('\n');
+    statusLine.trim();
+}
+
+if (PRESENCE_DEBUG) {
+  Serial.printf_P(PSTR("PRESENCE HTTP status: '%s' avail=%d connected=%d\n"),
+                  statusLine.c_str(),
+                  (int)presenceClient.available(),
+                  (int)presenceClient.connected());
+}
+
+
+if (statusLine.length() == 0) {
+    // nichts bekommen -> Diagnose + fail
+    char err[128];
+    presenceClient.getLastSSLError(err, sizeof(err));
+if (PRESENCE_DEBUG) {
+  Serial.printf_P(PSTR("PRESENCE FAIL: empty statusline (SSL err: %s)\n"), err);
+}
+presenceClient.stop();
+presence_conn_open_ms = 0;
+presence_last_use_ms  = 0;
+return false;
+
+}
+
+
+if (!(statusLine.startsWith("HTTP/1.1 2") || statusLine.startsWith("HTTP/1.0 2")))
+{
+    // Dump ein paar Header-Zeilen zur Diagnose (max 12)
+if (PRESENCE_DEBUG) {
+  for (int i = 0; i < 12 && presenceClient.connected(); i++)
+  {
+      String line = presenceClient.readStringUntil('\n');
+      if (line == "\r" || line.length() == 0) break;
+      line.trim();
+      Serial.printf_P(PSTR("PRESENCE HDR: %s\n"), line.c_str());
+      yield();
+  }
+} else {
+  // wenn kein Debug: Header einfach skippen (wie du es sowieso schon machst)
+}
+
+
+presenceClient.stop();
+presence_conn_open_ms = 0;
+presence_last_use_ms  = 0;
+return false;
+}
+
+
+
+
+// ---- Header lesen + Content-Length extrahieren ----
+int contentLen = -1;
+uint32_t t_hdr = millis();
+
+while ((millis() - t_hdr) < 800)
+{
+    if (!presenceClient.available())
+    {
+        if (!presenceClient.connected()) break;
+        pumpBackground();
+        continue;
+    }
+
+    String line = presenceClient.readStringUntil('\n');
+    line.trim(); // entfernt \r
+
+    if (line.length() == 0) break; // leer = Header-Ende
+
+    // Content-Length: 123
+    if (line.startsWith("Content-Length:") || line.startsWith("content-length:"))
+    {
+        String v = line.substring(strlen("Content-Length:"));
+        v.trim();
+        contentLen = v.toInt();
+    }
+
+    pumpBackground();
+}
+
+
+
+
+// ---- Body vollständig lesen (Keep-Alive braucht "sauberen" Socket) ----
+int firstNonWs = -1;
+int bytesRead = 0;
+uint32_t tBody = millis();
+
+// Wenn Content-Length bekannt: exakt so viele Bytes lesen.
+// Wenn unbekannt: wir lesen bis Timeout oder bis wir mind. 1 sinnvolles Byte haben.
+while ((millis() - tBody) < 600)
+{
+    while (presenceClient.available())
+    {
+        int b = presenceClient.read();
+        bytesRead++;
+
+        // erstes nicht-Whitespace Byte merken
+        if (firstNonWs < 0 && b >= 0 && b != '\r' && b != '\n' && b != ' ' && b != '\t')
+        {
+            firstNonWs = b;
+        }
+
+        // Wenn wir Content-Length kennen und komplett haben -> fertig
+        if (contentLen >= 0 && bytesRead >= contentLen)
+            goto body_done;
+    }
+
+    if (!presenceClient.connected())
+        break;
+
+    pumpBackground();
+}
+
+body_done:
+
+if (firstNonWs < 0)
+{
+    if (PRESENCE_DEBUG) Serial.println(F("PRESENCE BODY: <no non-ws byte>"));
+presenceClient.stop(); // bei Fehler lieber schließen
+presence_conn_open_ms = 0;
+presence_last_use_ms  = 0;
+return false;
+
+}
+
+if (PRESENCE_DEBUG)
+{
+    Serial.printf_P(PSTR("PRESENCE BODY first byte: '%c' (%d) contentLen=%d bytesRead=%d\n"),
+                    (char)firstNonWs, firstNonWs, contentLen, bytesRead);
+}
+
+outAllowed = (firstNonWs == '1');
+
+// Wichtig: Presence TLS immer schließen, damit MQTT TLS genug RAM hat
+presenceClient.stop();
+presence_conn_open_ms = 0;
+presence_last_use_ms  = 0;
+
+return true;
+
+
+
+
+#endif
+}
+
+// --- CLOUD DEBUG helper (wirkt nur im Cloud-Mode) ---
+static void dbgCloudState(const char* tag)
+{
+#if defined(ESP8266)
+  if (!mqttCloudMode) return;
+
+  Serial.printf_P(PSTR("[%s] presAllowed=%d paused=%d nextPollIn=%ld activeIn=%ld graceIn=%ld "
+                       "mqttConn=%d mqttState=%d enableMqtt=%d paired=%d codeLen=%u heap=%u\n"),
+    tag,
+    presence_allowed ? 1 : 0,
+    presence_polling_paused ? 1 : 0,
+    (long)(presence_next_poll_ms - millis()),
+    (long)(presence_active_until_ms - millis()),
+    (long)(presence_grace_until_ms - millis()),
+    (mqttClient ? mqttClient->connected() : 0),
+    (mqttClient ? mqttClient->state() : 999),
+    enableMqtt ? 1 : 0,
+    isPaired() ? 1 : 0,
+    (unsigned)mqttPairingCode.length(),
+    ESP.getFreeHeap()
+  );
+#endif
+}
+
+
+
+static void updatePresenceGate()
+{
+  uint32_t now = millis();
+
+  if (!cloudPollingEnabled())
+  {
+    // Nicht "abschalten" (next_poll_ms=0) -> sonst kann Polling nach kurzen Aussetzern tot bleiben.
+    // Stattdessen: Presence als nicht erlaubt markieren und in wenigen Sekunden erneut versuchen.
+    presence_allowed = false;
+    presence_active_until_ms = 0;
+    presence_grace_until_ms  = 0;
+    if (presence_next_poll_ms == 0) {
+      presence_next_poll_ms = now + 5000UL;
+    } else {
+      presence_next_poll_ms = now + 5000UL;
+    }
+    if (PRESENCE_DEBUG) dbgCloudState("POLLING_OFF_RETRY");
+    return;
+  }
+
+  // nicht fällig -> raus
+  if (presence_next_poll_ms != 0 && (int32_t)(now - presence_next_poll_ms) < 0) {
+    return;
+  }
+
+#if defined(ESP8266)
+  // Low-heap: NICHT presence abschießen, nur später nochmal versuchen
+  if (ESP.getFreeHeap() < 12000 || ESP.getMaxFreeBlockSize() < 6000) {
+    presence_next_poll_ms = now + addJitter(60000UL);
+    return;
+  }
+#endif
+
+  bool allowed = false;
+  bool ok = cloudPresenceFetch(allowed);
+
+  if (PRESENCE_DEBUG) {
+    Serial.printf_P(PSTR("PRESENCE > ok=%d allowed=%d heap=%u\n"),
+                    ok ? 1 : 0, allowed ? 1 : 0, ESP.getFreeHeap());
+  }
+
+  if (ok) {
+    presence_allowed = allowed;
+
+    // Debug-Helfer: nur anzeigen, nicht als Logik nutzen
+    if (allowed) {
+      presence_active_until_ms = now + PRESENCE_ACTIVE_WINDOW_MS;
+      presence_grace_until_ms  = now + PRESENCE_GRACE_MS;
+      presence_next_poll_ms = now + addJitter(PRESENCE_POLL_ONLINE_MS);
+
+
+
+    } else {
+      presence_active_until_ms = 0;
+      presence_grace_until_ms  = 0;
+      presence_next_poll_ms    = now + addJitter(PRESENCE_POLL_OFFLINE_MS);
+    }
+    return;
+  }
+
+  // Fetch-Fehler: fail-open (Presence bleibt wie sie ist)
+  // (du willst ja nicht bei TLS-Jitter sofort offline gehen)
+  presence_next_poll_ms = now + addJitter(PRESENCE_POLL_BURST_MS);
+
+}
+
+
+
+#if defined(ESP8266)
+static String sha256Hex(const String& input)
+{
+    br_sha256_context ctx;
+    br_sha256_init(&ctx);
+    br_sha256_update(&ctx, input.c_str(), input.length());
+
+    unsigned char out[32];
+    br_sha256_out(&ctx, out);
+
+    static const char hex[] = "0123456789abcdef";
+    char buf[65];
+    for (int i = 0; i < 32; i++)
+    {
+        buf[i * 2]     = hex[(out[i] >> 4) & 0x0F];
+        buf[i * 2 + 1] = hex[out[i] & 0x0F];
+    }
+    buf[64] = 0;
+    return String(buf);
+}
+#endif
+
+
+static String lastPairHash;
+
+
+static void publishPairingHash()
+{
+    if (!mqttClient || !mqttClient->connected()) return;
+    if (!mqttCloudMode) return;
+
+    String code = mqttPairingCode;
+    code.trim();
+    if (code.length() < 4) return;
+
+    String mac = getMacClean();
+    String payload = mac + ":" + code;
+
+#if defined(ESP8266)
+    String hash = sha256Hex(payload);
+#else
+    String hash = "";
+#endif
+
+    // Guard: nur bei Änderung publishen
+    if (hash == lastPairHash) return;
+    lastPairHash = hash;
+
+    String topic = String(mqttBaseTopic) + "/pairing/hash";
+    mqttClient->publish(topic.c_str(), hash.c_str(), true);
+
+    Serial.print(F("PAIRING > published NEW retained hash to "));
+    Serial.println(topic);
+}
+
+
+static void publishStatusRetained(const char* status)
+{
+    if (!mqttClient || !mqttClient->connected()) return;
+
+    mqttClient->publish((String(mqttBaseTopic) + F("/Status")).c_str(), status, true);
+
+    // kurz pumpen, damit das Publish wirklich rausgeht, bevor du disconnectest
+    uint32_t t0 = millis();
+    while ((uint32_t)(millis() - t0) < 150) {
+        mqttClient->loop();
+        delay(0);  // yield für ESP8266
+    }
+}
+
+
+#if defined(ESP8266)
+static void hardResetMqttStack(const char* reason)
+{
+    Serial.printf_P(PSTR("MQTT HARD RESET: %s\n"), reason ? reason : "(no reason)");
+
+    // Stop timers that might use mqttClient while we rebuild it
+    if (updateMqttTimer.active()) updateMqttTimer.detach();
+
+    // Crash-Fix: keine delete/new mehr (Heap-Frag/Use-After-Free vermeiden)
+    if (mqttClient) {
+        if (mqttClient->connected()) mqttClient->disconnect();
+    }
+    if (tlsClient) {
+        tlsClient->stop();
+    }
+    // Pointer bleiben gültig (statische Objekte)
+    tlsClient   = &tlsClientStatic;
+    tlsCa       = &tlsCaStatic;
+    aWifiClient = tlsClient;
+    mqttClient  = &mqttClientStatic;
+    mqttClient->setClient(*aWifiClient);
+
+
+    // Presence socket also closed (fresh connect anyway)
+    presenceClient.stop();
+
+    // Re-init MQTT stack
+    startMqtt();
+
+    // Allow immediate reconnect attempt in Cloud loop
+    cloud_next_mqtt_try_ms = 0;
+    mqtt_fail_streak = 0;
+    mqtt_stack_reset_ms = millis();
+}
+
+static void cloudMqttSupervisorTick()
+{
+    if (!mqttCloudMode) return;
+    if (!enableMqtt) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (!isPaired()) return;
+
+    // only supervise when we actually want MQTT online
+    const bool shouldRun = presence_allowed || cloudBootstrapActive();
+    if (!shouldRun) return;
+
+    const uint32_t now = millis();
+
+    // If mqttClient got nulled (after a stopall or error), rebuild it
+    if (!mqttClient) {
+        // avoid tight loops
+        if ((int32_t)(now - mqtt_stack_reset_ms) > 30000) {
+            hardResetMqttStack("mqttClient==nullptr");
+        }
+        return;
+    }
+
+    if (mqttClient->connected()) {
+        mqtt_last_connected_ms = now;
+        mqtt_fail_streak = 0;
+        return;
+    }
+
+    // Stuck heuristic: many consecutive failures or too long without a successful connection
+    const bool tooLongOffline = (mqtt_last_connected_ms != 0) && ((uint32_t)(now - mqtt_last_connected_ms) > 10UL*60UL*1000UL);
+    const bool manyFails      = (mqtt_fail_streak >= 12); // ~12 failed attempts (with 5s retry ~= 1min)
+
+    // Rate-limit hard resets
+    if ((tooLongOffline || manyFails) && ((uint32_t)(now - mqtt_stack_reset_ms) > 120000UL)) {
+        hardResetMqttStack(tooLongOffline ? "offline>10min" : "many connect fails");
+    }
+}
+#endif
+
+
+
+
 
 // initial stack
 char *stack_start;
@@ -27,7 +737,25 @@ void cb_gotIP(const WiFiEventStationModeGotIP& event)
 void cb_disconnected(const WiFiEventStationModeDisconnected& event)
 {
     Serial.println(F("disconnected"));
+
+    // --- Cloud Recovery: reset gating + close sockets on WiFi drop ---
+    presence_allowed = false;
+    presence_next_poll_ms = 0;
+    presence_active_until_ms = 0;
+    presence_grace_until_ms  = 0;
+    cloud_next_mqtt_try_ms = 0;
+
+#if defined(ESP8266)
+    // close MQTT/TLS sockets to avoid stuck sessions
+    if (mqttClient && mqttClient->connected()) {
+        publishStatusRetained("Asleep");
+        mqttClient->disconnect();
+    }
+    if (aWifiClient) aWifiClient->stop();
+    presenceClient.stop();
+#endif
 }
+
 
 void setup()
 {
@@ -36,14 +764,47 @@ void setup()
     char stack;
     stack_start = &stack;
 
-    Serial.begin(76800);
-    BWC_LOG_P(PSTR("\nStart\n"),0);
+    Serial.begin(115200);
+    randomSeed(ESP.getChipId() ^ micros());
+    Serial.println();
+    Serial.println(F("[BOOT] ResetInfo:"));
+    Serial.println(ESP.getResetInfo());
+    Serial.printf_P(PSTR("[BOOT] Heap=%u maxBlock=%u frag=%u%%\n"),
+                    ESP.getFreeHeap(), ESP.getMaxFreeBlockSize(), ESP.getHeapFragmentation());
+    
+    // Capture boot diagnostics for Web UI (/diag)
+    g_boot_millis = millis();
+    {
+        String tmp;
+        tmp.reserve(512);
+        tmp += F("ResetReason: ");
+        tmp += ESP.getResetReason();
+        tmp += F("\n\nResetInfo:\n");
+        tmp += ESP.getResetInfo();
+        tmp += F("\n\nLastRestartMarker:\n");
+        if (g_last_restart_marker_boot.length()) tmp += g_last_restart_marker_boot; else tmp += F("(none)");
+
+        tmp += F("\n\nBootHeap: ");
+        tmp += String(ESP.getFreeHeap());
+        tmp += F("  maxBlock: ");
+        tmp += String(ESP.getMaxFreeBlockSize());
+        tmp += F("  frag: ");
+        tmp += String(ESP.getHeapFragmentation());
+        tmp += F("%\nChipID: ");
+        tmp += String(ESP.getChipId(), HEX);
+        tmp += F("\nSDK: ");
+        tmp += ESP.getSdkVersion();
+        g_boot_diag = tmp;
+    }
+
+BWC_LOG_P(PSTR("\nStart\n"),0);
     BWC_LOG_P(PSTR("Millis: %d @ line: %d\n"), millis(), __LINE__);
     /*register wifi events */
     gotIpEventHandler = WiFi.onStationModeGotIP(cb_gotIP);
     disconnectedEventHandler = WiFi.onStationModeDisconnected(cb_disconnected);
 
     LittleFS.begin();
+    loadRestartMarkerBoot();
     {
         HeapSelectIram ephemeral;
         // Serial.printf_P(PSTR("IRamheap %d\n"), ESP.getFreeHeap());
@@ -54,11 +815,17 @@ void setup()
     bwc->setup();
     bwc->loop();
     periodicTimer.attach(periodicTimerInterval, []{ periodicTimerFlag = true; });
-    // delayed mqtt start
-    startComplete_ticker.attach(30, []{ if(useMqtt) enableMqtt = true; startComplete_ticker.detach(); });
     // update webpage every 2 seconds. (will also be updated on state changes)
     updateWSTimer.attach(2.0, []{ sendWSFlag = true; });
     loadWebConfig();
+    // delayed mqtt start
+    // Cloud-Mode: MQTT darf direkt (Presence regelt sowieso), Custom: kann verzögert bleiben
+if (mqttCloudMode) {
+  enableMqtt = useMqtt;
+} else {
+  startComplete_ticker.attach(30, []{ if(useMqtt) enableMqtt = true; startComplete_ticker.detach(); });
+}
+
     startWiFi();
     if(bwc->hasTempSensor)
     { 
@@ -94,16 +861,121 @@ void loop()
         // listen for OTA events
         ArduinoOTA.handle();
 
-        // MQTT
-        if (enableMqtt && mqttClient->loop())
+        // --- Cloud Presence Boot-Rearm (wichtig nach Power-Cycle) ---
+        // Sobald WiFi verbunden ist, erzwingen wir einmalig einen sofortigen Presence-Poll.
+        // Dadurch hängt das Polling NICHT vom Webinterface ab.
+        static bool presenceBootArmed = false;
+        static uint32_t presenceBootArmStartMs = 0;
+        if (presenceBootArmStartMs == 0) presenceBootArmStartMs = millis();
+
+        if (mqttCloudMode && useMqtt && !presenceBootArmed) {
+            if (WiFi.status() == WL_CONNECTED) {
+                presenceBootArmed = true;
+                presence_next_poll_ms = millis(); // sofort fällig
+                if (PRESENCE_DEBUG) Serial.println(F("[CLOUD] Boot-Rearm: forcing presence poll now"));
+            } else if ((uint32_t)(millis() - presenceBootArmStartMs) > 30000UL) {
+                // Fallback: auch wenn WL_CONNECTED nie kommt, trotzdem rearm (verhindert "tot")
+                presenceBootArmed = true;
+                presence_next_poll_ms = millis();
+                if (PRESENCE_DEBUG) Serial.println(F("[CLOUD] Boot-Rearm fallback: forcing presence poll now"));
+            }
+        }
+
+        // --- Cloud Presence Tick: immer laufen lassen (unabhängig von enableMqtt/WebUI) ---
+        if (mqttCloudMode && useMqtt) {
+            static uint32_t nextGateTickMs = 0;
+            if ((int32_t)(millis() - nextGateTickMs) >= 0) {
+                nextGateTickMs = millis() + 2000UL; // 2s
+                updatePresenceGate();
+            }
+        }
+
+        // Regelmäßiges Yield, damit WiFi/Webserver nicht verhungern
+        delay(0);
+
+        // Wenn Cloud/MQTT in der Config deaktiviert ist: Presence-Gate hart aus (kein Polling, kein Cloud-MQTT)
+        if (mqttCloudMode && !useMqtt) {
+            presence_allowed = false;
+            presence_next_poll_ms = 0;
+            presence_grace_until_ms = 0;
+        }
+
+
+
+// MQTT
+if (mqttCloudMode || enableMqtt)
+{
+// -----------------------------
+// Cloud Mode: Presence Gate wird jetzt unabhängig von enableMqtt weiter oben getickt.
+// -----------------------------
+// Debug nur wenn PRESENCE_DEBUG=true
+if (PRESENCE_DEBUG) {
+  static uint32_t dbgT = 0;
+  if ((uint32_t)(millis() - dbgT) > 2000UL) {
+    dbgT = millis();
+    dbgCloudState("CLOUD");
+  }
+}
+
+
+
+    // 2) Wenn Presence erlaubt: MQTT normal betreiben
+    if (presence_allowed || cloudBootstrapActive())
+
+    {
+// Presence erlaubt => im Cloud-Mode MUSS MQTT laufen (mit Retry), ohne HA/Custom anzufassen
+// Cloud: MQTT nur betreiben wenn Presence erlaubt ODER Bootstrap aktiv
+bool mqttShouldRun = presence_allowed || cloudBootstrapActive();
+
+if (mqttClient) mqttClient->loop();
+
+if (mqttShouldRun)
+{
+    if (mqttClient && !mqttClient->connected())
+    {
+        if ((int32_t)(millis() - cloud_next_mqtt_try_ms) >= 0)
         {
+            cloud_next_mqtt_try_ms = millis() + 5000UL;
+
+            Serial.printf_P(PSTR("CLOUD: mqttConnect() (pres=%d boot=%d)\n"),
+                            presence_allowed ? 1 : 0,
+                            cloudBootstrapActive() ? 1 : 0);
+
+            mqttConnect();
+        }
+    }
+}
+else
+{
+    // Presence nicht erlaubt und Bootstrap aus -> MQTT sauber offline halten
+    if (mqttClient && mqttClient->connected())
+    {
+        publishStatusRetained("Asleep");
+        mqttClient->disconnect();
+    }
+    if (aWifiClient) aWifiClient->stop();   // Socket immer zu
+}
+
+
+
+        // Telemetry-Interval im Cloud-Mode wie bisher über millis steuern
+        if (mqttClient && mqttClient->connected())
+        {
+            uint32_t nowMs = millis();
+            uint32_t intervalMs = (uint32_t)mqttTelemetryInterval * 1000UL;
+            if (intervalMs > 0 && (int32_t)(nowMs - sar_cloud_next_telemetry_ms) >= 0)
+            {
+                sar_cloud_next_telemetry_ms = nowMs + intervalMs;
+                sendMQTTFlag = true;
+            }
+
+            // Button publish nur wenn changed (Cloud: nicht retained)
             String msg;
             msg.reserve(32);
             bwc->getButtonName(msg);
-            // publish pretty button name if display button is pressed (or NOBTN if released)
             if (!msg.equals(prevButtonName))
             {
-                mqttClient->publish((String(mqttBaseTopic) + "/button").c_str(), String(msg).c_str(), true);
+                mqttClient->publish((String(mqttBaseTopic) + F("/button")).c_str(), msg.c_str(), false);
                 prevButtonName = msg;
             }
 
@@ -113,12 +985,61 @@ void loop()
                 sendMQTTFlag = false;
             }
 
-            if(send_mqtt_cfg_needed)
+            if (send_mqtt_cfg_needed)
             {
                 send_mqtt_cfg_needed = false;
                 sendMQTTConfig();
             }
         }
+    }
+    else
+    {
+        // 3) Presence nicht erlaubt -> MQTT sauber offline halten
+        if (mqttClient && mqttClient->connected())
+        {
+publishStatusRetained("Asleep");
+mqttClient->disconnect();
+if (aWifiClient) aWifiClient->stop();   // ✅ sauber TLS socket zu
+        }
+    }
+}
+
+    // --------------------------------
+    // Custom/HomeAssistant: unverändert
+    // --------------------------------
+    else
+    {
+        if (mqttClient->loop())
+        {
+            String msg;
+            msg.reserve(32);
+            bwc->getButtonName(msg);
+
+            // Home/Custom: retained wie gewohnt
+            if (!msg.equals(prevButtonName))
+            {
+                const bool retainButton = true;
+                mqttClient->publish((String(mqttBaseTopic) + F("/button")).c_str(), msg.c_str(), retainButton);
+                prevButtonName = msg;
+            }
+            
+            if (newData || sendMQTTFlag)
+            {
+                sendMQTT();
+                sendMQTTFlag = false;
+            }
+
+            if (send_mqtt_cfg_needed)
+            {
+                send_mqtt_cfg_needed = false;
+                sendMQTTConfig();
+            }
+        }
+    }
+
+#if defined(ESP8266)
+        cloudMqttSupervisorTick();
+#endif
 
         // web socket
         if (newData || sendWSFlag)
@@ -137,20 +1058,18 @@ void loop()
             bwc->print(F("check network"));
             // Serial.println(F("WiFi > Trying to reconnect ..."));
         }
-        if (WiFi.status() == WL_CONNECTED)
+if (WiFi.status() == WL_CONNECTED)
+{
+    // ✅ Im Cloud-Mode NICHT dauerhaft reconnecten (Duty-Cycle macht das)
+    if (enableMqtt && !mqttCloudMode)
+    {
+        if (!mqttClient->loop())
         {
-            // if (time(nullptr)<57600)
-            // {
-            //     // Serial.println(F("NTP > Start synchronisation"));
-            //     startNTP();
-            // }
-
-            if (enableMqtt && !mqttClient->loop())
-            {
-                // Serial.println(F("MQTT > Not connected"));
-                mqttConnect();
-            }
+            mqttConnect();
         }
+    }
+}
+
         // Leverage the pre-existing periodicTimerFlag to also set temperature, if enabled
         setTemperatureFromSensor();
 
@@ -176,13 +1095,25 @@ void loop()
         checkWiFi();
     }
     //Only do this if locked out! (by pressing POWER - LOCK - TIMER - POWER)
-    if(bwc->getBtnSeqMatch())
+// Debounced: require the sequence to be stable for 2s to avoid accidental resets due to noise.
+    static uint32_t btnSeqFirstMs = 0;
+    static bool btnSeqTriggered = false;
+    if (bwc->getBtnSeqMatch())
     {
-    
-    resetWiFi();
-    delay(3000);
-    ESP.reset();
-    delay(3000);
+        if (btnSeqFirstMs == 0) btnSeqFirstMs = millis();
+        if (!btnSeqTriggered && (millis() - btnSeqFirstMs) > 2000)
+        {
+            btnSeqTriggered = true;
+            Serial.println(F("[SYS] Button reset sequence confirmed -> resetting WiFi + restart"));
+            resetWiFi();
+            delay(1000);
+            requestRestart(__FUNCTION__);
+        }
+    }
+    else
+    {
+        btnSeqFirstMs = 0;
+        btnSeqTriggered = false;
     }
     //handleAUX();
     // static int temp_counter = 0;
@@ -288,14 +1219,16 @@ void getOtherInfo(String &rtn)
  */
 void sendMQTT()
 {
-    // HeapSelectIram ephemeral;
-    // Serial.printf("IRamheap %d\n", ESP.getFreeHeap());
     String json;
     json.reserve(320);
 
-    // send states
+    // ✅ Telemetry retained nur im Custom/HomeAssistant Mode
+    // Cloud => retain=false (spart Rule-Actions / retained churn)
+    const bool retainTelemetry = !mqttCloudMode;
+
+    // --- STATES (/message) ---
     bwc->getJSONStates(json);
-    if (mqttClient->publish((String(mqttBaseTopic) + F("/message")).c_str(), String(json).c_str(), true))
+    if (mqttClient->publish((String(mqttBaseTopic) + F("/message")).c_str(), json.c_str(), retainTelemetry))
     {
         BWC_LOG_P(PSTR("MQTT > message published\n"),0);
     }
@@ -304,22 +1237,28 @@ void sendMQTT()
         BWC_LOG_P(PSTR("MQTT > message not published"),0);
     }
 
-    // send times
-    json.clear();
-    bwc->getJSONTimes(json);
-    if (mqttClient->publish((String(mqttBaseTopic) + F("/times")).c_str(), String(json).c_str(), true))
+    // --- TIMES (/times) ---
+    // ✅ In Cloud-Mode optional komplett weglassen (dein Wunsch)
+    // HomeAssistant/Custom bleibt unverändert.
+    if (!mqttCloudMode)
     {
-        BWC_LOG_P(PSTR("MQTT > times published"),0);
-    }
-    else
-    {
-        BWC_LOG_P(PSTR("MQTT > times not published"),0);
+        json.clear();
+        bwc->getJSONTimes(json);
+        if (mqttClient->publish((String(mqttBaseTopic) + F("/times")).c_str(), json.c_str(), retainTelemetry))
+        {
+            BWC_LOG_P(PSTR("MQTT > times published"),0);
+        }
+        else
+        {
+            BWC_LOG_P(PSTR("MQTT > times not published"),0);
+        }
     }
 
-    //send other info
+    // --- OTHER (/other) ---
+    // ✅ brauchst du in Cloud (sagst du), daher immer senden
     json.clear();
     getOtherInfo(json);
-    if (mqttClient->publish((String(mqttBaseTopic) + F("/other")).c_str(), String(json).c_str(), true))
+    if (mqttClient->publish((String(mqttBaseTopic) + F("/other")).c_str(), json.c_str(), retainTelemetry))
     {
         BWC_LOG_P(PSTR("MQTT > other published"),0);
     }
@@ -329,14 +1268,19 @@ void sendMQTT()
     }
 }
 
+
 void sendMQTTConfig()
 {
     String json;
     json.reserve(320);
     bwc->getJSONSettings(json);
-    mqttClient->publish((String(mqttBaseTopic) + F("/get_config")).c_str(), String(json).c_str(), true);
+
+    const bool retainCfg = !mqttCloudMode; // Cloud => false, Custom/Home => true
+
+    mqttClient->publish((String(mqttBaseTopic) + F("/get_config")).c_str(), json.c_str(), retainCfg);
     mqttClient->loop();
 }
+
 
 /**
  * Start a Wi-Fi access point, and try to connect to some given access points.
@@ -501,33 +1445,67 @@ void stopall()
 {
     Serial.printf_P(PSTR("Free mem before stop: %d\n"), ESP.getFreeHeap());
     bwc->stop();
+
     Serial.println(F("detaching"));
     updateMqttTimer.detach();
     periodicTimer.detach();
     updateWSTimer.detach();
-    if(ntpCheck_ticker.active()) ntpCheck_ticker.detach();
-    if(checkWifi_ticker.active()) checkWifi_ticker.detach();
-    //bwc->saveSettings();
-    delete tempSensors;
-    delete oneWire;
+    if (ntpCheck_ticker.active()) ntpCheck_ticker.detach();
+    if (checkWifi_ticker.active()) checkWifi_ticker.detach();
+
+    // --- sensors ---
+    if (tempSensors) { delete tempSensors; tempSensors = nullptr; }
+    if (oneWire)     { delete oneWire;     oneWire     = nullptr; }
+
+    // --- MQTT/TLS ---
     Serial.println(F("stopping mqtt"));
-    if(enableMqtt) mqttClient->disconnect();
-    delete aWifiClient;
-    // delete mqttClient; //Compiler nagging about not deleting virtual classes.
-    mqttClient = nullptr;
+
+    // Crash-Fix: MQTT/TLS sind statisch – nichts löschen, nur sauber trennen
+    if (mqttClient) {
+        if (mqttClient->connected()) mqttClient->disconnect();
+    }
+
+#if defined(ESP8266)
+    aWifiClient = tlsClient; // zeigt auf statischen TLS Client
+    if (tlsClient) tlsClient->stop();
+    // tlsCa bleibt statisch (keine Aktion nötig)
+    tlsClient  = &tlsClientStatic;
+    tlsCa      = &tlsCaStatic;
+    aWifiClient = tlsClient;
+    mqttClient  = &mqttClientStatic;
+    mqttClient->setClient(*aWifiClient);
+#else
+    aWifiClient = &wifiClientStatic;
+    mqttClient  = &mqttClientStatic;
+    mqttClient->setClient(*aWifiClient);
+#endif
+
+
+    // --- Presence TLS (Cloud Functions) ---
+    presenceClient.stop(); // Verbindung schließen
+    if (presenceCa)
+    {
+        delete presenceCa;
+        presenceCa = nullptr;
+    }
+    presenceTlsReady = false;
+
+
+
+    // --- server/ws/fs (auch mit Guards, damit's nicht crasht) ---
     Serial.println(F("stopping server"));
-    server->stop();
-    delete server;
-    server = nullptr;
+    if (server) { server->stop(); delete server; server = nullptr; }
+
     Serial.println(F("stopping ws"));
-    webSocket->close();
-    delete webSocket;
-    webSocket = nullptr;
+    if (webSocket) { webSocket->close(); delete webSocket; webSocket = nullptr; }
+
     Serial.println(F("stopping FS"));
     LittleFS.end();
+
     Serial.println(F("end stopall"));
     Serial.printf_P(PSTR("Free mem after stop: %d\n"), ESP.getFreeHeap());
 }
+
 
 /*pause: action=true cont: action=false*/
 void pause_all(bool action)
@@ -626,6 +1604,8 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len)
 /**
  * start a HTTP server with a file read and upload handler
  */
+void handleDiag();
+
 void startHttpServer()
 {
     if(server != nullptr)
@@ -639,6 +1619,8 @@ void startHttpServer()
     {
         // HeapSelectIram ephemeral;
         server = new ESP8266WebServer(80);
+        server->on(F("/diag"), handleDiag);
+        server->on(F("/diag/"), handleDiag);
         server->on(F("/getconfig/"), handleGetConfig);
         server->on(F("/setconfig/"), handleSetConfig);
         server->on(F("/getcommands/"), handleGetCommandQueue);
@@ -963,6 +1945,40 @@ bool checkHttpPost(HTTPMethod method)
  * response for /getconfig/
  * web server prints a json document
  */
+
+void handleDiag()
+{
+    if(server == nullptr) return;
+
+    String out;
+    out.reserve(1024);
+
+    out += F("<html><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+             "<title>ESP8266 /diag</title></head><body>"
+             "<h2>ESP8266 Diagnostics</h2><pre>");
+
+    out += htmlEscape(g_boot_diag);
+
+    out += F("\n\n--- Live ---\nUptime(ms): ");
+    out += String(millis());
+    out += F("\nHeap: ");
+    out += String(ESP.getFreeHeap());
+    out += F("\nmaxBlock: ");
+    out += String(ESP.getMaxFreeBlockSize());
+    out += F("\nfrag: ");
+    out += String(ESP.getHeapFragmentation());
+    out += F("%\nWiFi: ");
+    out += (WiFi.status() == WL_CONNECTED) ? F("connected") : F("not connected");
+    out += F("\nIP: ");
+    out += WiFi.localIP().toString();
+
+    out += F("</pre></body></html>");
+
+    server->send(200, F("text/html; charset=utf-8"), out);
+}
+
+
 void handleGetConfig()
 {
     if (!checkHttpPost(server->method())) return;
@@ -1451,9 +2467,9 @@ void handleResetWifi()
     // Serial.println(F("WiFi connection reset (erase) ... done."));
     // Serial.println(F("ESP reset ..."));
     #if defined(ESP8266)
-    ESP.reset();
+    requestRestart(__FUNCTION__);
     #else
-    ESP.restart();
+    requestRestart(__FUNCTION__);
     #endif
 }
 
@@ -1487,7 +2503,7 @@ void resetWiFi()
  */
 void loadMqtt()
 {
-    File file = LittleFS.open("mqtt.json", "r");
+    File file = LittleFS.open(F("/mqtt.json"), "r");
     if (!file)
     {
         Serial.println(F("Failed to read mqtt.json. Using defaults."));
@@ -1516,7 +2532,43 @@ void loadMqtt()
     mqttClientId = doc[F("mqttClientId")].as<String>();
     mqttBaseTopic = doc[F("mqttBaseTopic")].as<String>();
     mqttTelemetryInterval = doc[F("mqttTelemetryInterval")];
+    if (doc.containsKey(F("mqttMode")))
+    {
+        String mode = doc[F("mqttMode")].as<String>();
+        mqttCloudMode = mode.equalsIgnoreCase("cloud");
+    }
+
+if (doc.containsKey(F("mqttPairingCode")))
+{
+    String newCode = doc[F("mqttPairingCode")].as<String>();
+    newCode.trim();
+
+    String oldCode = mqttPairingCode;
+    oldCode.trim();
+
+    mqttPairingCode = newCode;
+
+    // Wenn sich der Code wirklich geändert hat: 10s MQTT erlauben (Cloud-Mode)
+    if (mqttCloudMode && newCode.length() >= 4 && newCode != oldCode)
+    {
+        cloud_pair_bootstrap_until_ms = millis() + 10000UL; // 10 Sekunden
+        Serial.println(F("PAIRING: bootstrap MQTT enabled for 10s"));
+        cloud_next_mqtt_try_ms = 0;   // sofortiger Connect-Versuch erlaubt
+
+// sofort versuchen (nicht warten bis loop tickt)
+if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->connected()) {
+  Serial.println(F("PAIRING: bootstrap -> mqttConnect() now"));
+  mqttConnect();
 }
+
+    }
+}
+
+
+
+}
+
+
 
 /**
  * save MQTT json configuration to "mqtt.json"
@@ -1543,6 +2595,11 @@ void saveMqtt()
     doc[F("mqttClientId")] = mqttClientId;
     doc[F("mqttBaseTopic")] = mqttBaseTopic;
     doc[F("mqttTelemetryInterval")] = mqttTelemetryInterval;
+    
+    doc[F("mqttMode")] = mqttCloudMode ? "cloud" : "custom";
+    doc[F("mqttPairingCode")] = mqttPairingCode;
+
+
 
     if (serializeJson(doc, file) == 0)
     {
@@ -1577,6 +2634,13 @@ void handleGetMqtt()
     doc[F("mqttBaseTopic")] = mqttBaseTopic;
     doc[F("mqttTelemetryInterval")] = mqttTelemetryInterval;
 
+    doc[F("mqttMode")] = mqttCloudMode ? "cloud" : "custom";
+    doc[F("deviceMac")] = WiFi.macAddress();
+    doc[F("deviceId")]  = getMacClean();
+    doc[F("mqttPairingCode")] = mqttPairingCode;
+
+
+
     String json;
     if (serializeJson(doc, json) == 0)
     {
@@ -1605,21 +2669,71 @@ void handleSetMqtt()
 
     useMqtt = doc[F("enableMqtt")];
     enableMqtt = useMqtt;
-    mqttIpAddress[0] = doc[F("mqttIpAddress")][0];
-    mqttIpAddress[1] = doc[F("mqttIpAddress")][1];
-    mqttIpAddress[2] = doc[F("mqttIpAddress")][2];
-    mqttIpAddress[3] = doc[F("mqttIpAddress")][3];
-    mqttPort = doc[F("mqttPort")];
-    mqttUsername = doc[F("mqttUsername")].as<String>();
-    mqttPassword = doc[F("mqttPassword")].as<String>();
-    mqttClientId = doc[F("mqttClientId")].as<String>();
-    mqttBaseTopic = doc[F("mqttBaseTopic")].as<String>();
+
+    if (doc.containsKey(F("mqttMode")))
+    {
+        String mode = doc[F("mqttMode")].as<String>();
+        mqttCloudMode = mode.equalsIgnoreCase("cloud");
+    }
+
+if (doc.containsKey(F("mqttPairingCode")))
+{
+    String newCode = doc[F("mqttPairingCode")].as<String>();
+    newCode.trim();
+
+    String oldCode = mqttPairingCode;
+    oldCode.trim();
+
+    mqttPairingCode = newCode;
+
+    if (mqttCloudMode && newCode.length() >= 4 && newCode != oldCode)
+    {
+        cloud_pair_bootstrap_until_ms = millis() + 10000UL; // 10 Sekunden
+        Serial.println(F("PAIRING: bootstrap MQTT enabled for 10s"));
+        cloud_next_mqtt_try_ms = 0;   // sofortiger Connect-Versuch erlaubt
+
+// sofort versuchen (nicht warten bis loop tickt)
+if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->connected()) {
+  Serial.println(F("PAIRING: bootstrap -> mqttConnect() now"));
+  mqttConnect();
+}
+
+    }
+}
+
+
+    // Nur im Custom Mode überschreiben wir Host/User/Pass/Topic
+    if (!mqttCloudMode)
+    {
+        mqttIpAddress[0] = doc[F("mqttIpAddress")][0];
+        mqttIpAddress[1] = doc[F("mqttIpAddress")][1];
+        mqttIpAddress[2] = doc[F("mqttIpAddress")][2];
+        mqttIpAddress[3] = doc[F("mqttIpAddress")][3];
+        mqttPort = doc[F("mqttPort")];
+        mqttUsername = doc[F("mqttUsername")].as<String>();
+        mqttPassword = doc[F("mqttPassword")].as<String>();
+        mqttClientId = doc[F("mqttClientId")].as<String>();
+        mqttBaseTopic = doc[F("mqttBaseTopic")].as<String>();
+    }
+
+    // Telemetry Interval darf in beiden Modi gesetzt werden
     mqttTelemetryInterval = doc[F("mqttTelemetryInterval")];
 
+
+
     server->send(200, F("text/plain"), "");
+        
+
 
     saveMqtt();
     startMqtt();
+
+    // Wenn MQTT schon verbunden ist, sofort aktualisieren.
+    // Falls startMqtt() neu verbindet, passiert es ohnehin nochmal bei mqttConnect().
+    if (mqttClient && mqttClient->connected()) {
+        publishPairingHash();
+}
+
 }
 
 /**
@@ -1783,7 +2897,7 @@ void handleRestart()
     stopall();
     delay(1000);
     Serial.println(F("ESP restart ..."));
-    ESP.restart();
+    requestRestart(__FUNCTION__);
     delay(3000);
 }
 
@@ -1806,36 +2920,96 @@ void updateError(int err){
  */
 void startMqtt()
 {
+    Serial.printf_P(PSTR("DRAM heap before MQTT: %u\n"), ESP.getFreeHeap());
     {
-        HeapSelectIram ephemeral;
-        Serial.printf_P(PSTR("IRamheap %d\n"), ESP.getFreeHeap());
-        Serial.println(F("startmqtt"));
-        if(!aWifiClient) aWifiClient = new WiFiClient;
-        if(!mqttClient) mqttClient = new PubSubClient(*aWifiClient);
-    
-
-        // load mqtt credential file if it exists, and update default strings
-        loadMqtt();
-
-        // disconnect in case we are already connected
-        mqttClient->disconnect();
-
-        // setup MQTT broker information as defined earlier
-        mqttClient->setServer(mqttIpAddress, mqttPort);
-        // set buffer for larger messages, new to library 2.8.0
-        if (mqttClient->setBufferSize(1536))
-        {
-            // Serial.println(F("MQTT > Buffer size successfully increased"));
-        }
-        mqttClient->setKeepAlive(60);
-        mqttClient->setSocketTimeout(30);
-        // set callback details
-        // this function is called automatically whenever a message arrives on a subscribed topic.
-        mqttClient->setCallback(mqttCallback);
-        // Connect to MQTT broker, publish Status/MAC/count, and subscribe to keypad topic.
+        HeapSelectIram e;
+        Serial.printf_P(PSTR("IRAM heap before MQTT: %u\n"), ESP.getFreeHeap());
     }
-    mqttConnect();
+
+    Serial.println(F("startmqtt"));
+
+    // load mqtt credential file if it exists, and update default strings
+    loadMqtt();
+
+#if defined(ESP8266)
+    // Crash-Fix: statische TLS-Objekte (kein new/delete)
+    tlsClient = &tlsClientStatic;
+    tlsCa     = &tlsCaStatic;
+
+    tlsClient->setTrustAnchors(tlsCa);
+
+    // ✅ RAM sparen (wichtig!)
+    tlsClient->setBufferSizes(512, 512);
+
+    // ✅ Timeout nicht zu hoch, spart RAM/Blockaden
+    tlsClient->setTimeout(15);
+
+    aWifiClient = tlsClient;
+#else
+    // Crash-Fix: statischer Plain-WiFi Client
+    aWifiClient = &wifiClientStatic;
+#endif
+
+
+    mqttClient = &mqttClientStatic; mqttClient->setClient(*aWifiClient);
+
+// PubSub buffer: Cloud kleiner, Custom ggf. größer
+mqttClient->setBufferSize(mqttCloudMode ? 1024 : 1536);
+
+
+    // disconnect in case we are already connected
+    mqttClient->disconnect();
+
+// Device-ID (immer MAC-clean)
+String devId = getMacClean();
+
+// ClientId (kurz & stabil)
+mqttClientId = devId;
+
+// ------------------------------
+// Dual-Mode MQTT (Cloud vs Custom)
+// ------------------------------
+if (mqttCloudMode)
+{
+    // Cloud: immer EMQX + festes SAR BaseTopic
+    mqttBaseTopic = String(SAR_TOPIC_PREFIX) + devId;
+
+    mqttUsername = SAR_EMQX_USER;
+    mqttPassword = SAR_EMQX_PASS;
+    mqttPort     = SAR_EMQX_PORT;
+    mqttClient->setServer(SAR_EMQX_HOST, mqttPort);
 }
+else
+{
+    // Custom: Broker/Topic aus mqtt.json verwenden (NICHT überschreiben!)
+    // mqttBaseTopic/mqttUsername/mqttPassword/mqttPort wurden in loadMqtt() gesetzt
+
+    // mqttIpAddress[] kommt aus mqtt.json
+    mqttClient->setServer(mqttIpAddress, mqttPort);
+
+    // Optional: wenn mqttClientId im Custom gesetzt ist, dann nimm den
+    if (mqttClientId.length() == 0) mqttClientId = devId;
+}
+
+
+
+    mqttClient->setKeepAlive(60);
+    mqttClient->setSocketTimeout(30);
+    mqttClient->setCallback(mqttCallback);
+
+    Serial.printf_P(PSTR("DRAM heap after MQTT init: %u\n"), ESP.getFreeHeap());
+    {
+        HeapSelectIram e;
+        Serial.printf_P(PSTR("IRAM heap after MQTT init: %u\n"), ESP.getFreeHeap());
+    }
+
+    // Nicht sofort verbinden – im Cloud-Mode steuert Presence das
+if (!mqttCloudMode) {
+  mqttConnect();  // HomeAssistant/Custom bleibt wie gewohnt
+}
+
+}
+
 
 /**
  * MQTT callback function
@@ -1843,90 +3017,105 @@ void startMqtt()
  */
 void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
-    // Serial.print(F("MQTT > Message arrived ["));
-    // Serial.print(topic);
-    // Serial.print(")] ");
+    // Payload sicher in String kopieren (MQTT payload ist NICHT null-terminiert)
+    String message;
+    message.reserve(length + 1);
     for (unsigned int i = 0; i < length; i++)
+        message += (char)payload[i];
+
+    String t = String(topic);
+
+    // ---------- /command ----------
+    if (t.equals(String(mqttBaseTopic) + F("/command")))
     {
-        // Serial.print((char)payload[i]);
-    }
-    // Serial.println();
-    if (String(topic).equals(String(mqttBaseTopic) + F("/command")))
-    {
-        // DynamicJsonDocument doc(256);
         StaticJsonDocument<256> doc;
-        String message = (const char *) &payload[0];
         DeserializationError error = deserializeJson(doc, message);
-        if (error)
-        {
-            return;
-        }
+        if (error) return;
 
         Commands command = doc[F("CMD")];
-        int64_t value = doc[F("VALUE")];
-        int64_t xtime = doc[F("XTIME")];
+        int64_t value    = doc[F("VALUE")];
+        int64_t xtime    = doc[F("XTIME")];
         int64_t interval = doc[F("INTERVAL")];
-        String txt = doc[F("TXT")] | "";
+        String txt       = doc[F("TXT")] | "";
+
         command_que_item item;
-        item.cmd = command;
-        item.val = value;
-        item.xtime = xtime;
+        item.cmd      = command;
+        item.val      = value;
+        item.xtime    = xtime;
         item.interval = interval;
-        item.text = txt;
+        item.text     = txt;
+
         bwc->add_command(item);
         return;
     }
 
-    /* author @malfurion, edited by @visualapproach for v4 */
-    if (String(topic).equals(String(mqttBaseTopic) + F("/command_batch")))
+    // ---------- /command_batch ----------
+    if (t.equals(String(mqttBaseTopic) + F("/command_batch")))
     {
         DynamicJsonDocument doc(1024);
-        String message = (const char *) &payload[0];
         DeserializationError error = deserializeJson(doc, message);
-        if (error)
-        {
-            return;
-        }
+        if (error) return;
 
         JsonArray commandArray = doc.as<JsonArray>();
 
-        for (JsonVariant commandItem : commandArray) {
+        for (JsonVariant commandItem : commandArray)
+        {
             Commands command = commandItem[F("CMD")];
-            int64_t value = commandItem[F("VALUE")];
-            int64_t xtime = commandItem[F("XTIME")];
+            int64_t value    = commandItem[F("VALUE")];
+            int64_t xtime    = commandItem[F("XTIME")];
             int64_t interval = commandItem[F("INTERVAL")];
-            String txt = doc[F("TXT")] | "";
+
+            // ✅ FIX: TXT aus dem jeweiligen commandItem lesen, nicht aus doc
+            String txt = commandItem[F("TXT")] | "";
+
             command_que_item item;
-            item.cmd = command;
-            item.val = value;
-            item.xtime = xtime;
+            item.cmd      = command;
+            item.val      = value;
+            item.xtime    = xtime;
             item.interval = interval;
-            item.text = txt;
+            item.text     = txt;
+
             bwc->add_command(item);
         }
-
         return;
     }
 
-    if (String(topic).equals(String(mqttBaseTopic) + F("/set_config")))
+    // ---------- /set_config ----------
+    if (t.equals(String(mqttBaseTopic) + F("/set_config")))
     {
-        String message = (const char *) &payload[0];    
         bwc->setJSONSettings(message);
         send_mqtt_cfg_needed = true;
+        return;
     }
 }
+
 
 /**
  * Connect to MQTT broker, publish Status/MAC/count, and subscribe to keypad topic.
  */
 void mqttConnect()
 {
-    // do not connect if MQTT is not enabled
+    // In Cloud-Mode kann MQTT auch dann verbinden, wenn enableMqtt=false,
+    // solange Presence (oder Bootstrap) es erlaubt. enableMqtt ist in deinem
+    // Projekt historisch der "lokale MQTT-Schalter" (HA/Custom).
     if (!enableMqtt)
     {
-        return;
+        if (!(mqttCloudMode && (presence_allowed || cloudBootstrapActive())))
+        {
+            return;
+        }
     }
     Serial.println(F("mqttconn"));
+#if defined(ESP8266)
+    mqtt_last_attempt_ms = millis();
+#endif
+    // TLS braucht gültige Uhrzeit
+waitForValidTime(8000);
+
+
+#ifdef ESP8266
+  if (tlsClient) tlsClient->setX509Time(time(nullptr));
+#endif
 
     // Serial.print(F("MQTT > Connecting ... "));
     // We'll connect with a Retained Last Will that updates the 'Status' topic with "Dead" when the device goes offline...
@@ -1938,19 +3127,48 @@ void mqttConnect()
         0, // willQoS : the quality of service to be used by the will message (int : 0,1 or 2)
         1, // willRetain : whether the will should be published with the retain flag (int : 0 or 1)
         "Dead")) // willMessage : the payload of the will message (const char[])
+        
     {
         // Serial.println(F("success!"));
         mqtt_connect_count++;
+#if defined(ESP8266)
+        mqtt_last_connected_ms = millis();
+        mqtt_fail_streak = 0;
+#endif
 
-        // update MQTT every X seconds. (will also be updated on state changes)
-        updateMqttTimer.attach(mqttTelemetryInterval, []{ sendMQTTFlag = true; });
+if (mqttCloudMode)
+{
+    // Polling wird erst in der Cloud-Loop nach stabiler Verbindung pausiert
+    presence_polling_paused = false;
+}
+
+
+
+// update MQTT every X seconds. (will also be updated on state changes)
+// ✅ Im Cloud Duty-Cycle Mode KEIN Ticker, sonst triggert es unnötig außerhalb des Fensters
+if (!mqttCloudMode)
+{
+    updateMqttTimer.attach(mqttTelemetryInterval, []{ sendMQTTFlag = true; });
+}
+
+
+
+        
 
         // These all have the Retained flag set to true, so that the value is stored on the server and can be retrieved at any point
         // Check the 'Status' topic to see that the device is still online before relying on the data from these retained topics
-        mqttClient->publish((String(mqttBaseTopic) + F("/Status")).c_str(), "Alive", true);
-        mqttClient->publish((String(mqttBaseTopic) + F("/MAC_Address")).c_str(), WiFi.macAddress().c_str(), true);                 // Device MAC Address
-        mqttClient->publish((String(mqttBaseTopic) + F("/MQTT_Connect_Count")).c_str(), String(mqtt_connect_count).c_str(), true); // MQTT Connect Count
+const bool retainIdentity = !mqttCloudMode;   // Cloud: false, Custom: true
+const bool retainStatus   = true;            // Status retained ist sinnvoll (LWT + Online-Check)
+
+mqttClient->publish((String(mqttBaseTopic) + F("/Status")).c_str(), "Alive", retainStatus);
+mqttClient->publish((String(mqttBaseTopic) + F("/MAC_Address")).c_str(), WiFi.macAddress().c_str(), retainIdentity);
+mqttClient->publish((String(mqttBaseTopic) + F("/MQTT_Connect_Count")).c_str(), String(mqtt_connect_count).c_str(), retainIdentity);
+
         mqttClient->loop();
+
+        publishPairingHash();   // <-- HINZUFÜGEN
+        mqttClient->loop();
+
 
         // Watch the 'command' topic for incoming MQTT messages
         mqttClient->subscribe((String(mqttBaseTopic) + F("/command")).c_str());
@@ -1958,32 +3176,49 @@ void mqttConnect()
         mqttClient->subscribe((String(mqttBaseTopic) + F("/set_config")).c_str());
         mqttClient->loop();
 
-        #ifdef ESP8266
-        // mqttClient->publish((String(mqttBaseTopic) + "/reboot_time").c_str(), DateTime.format(DateFormatter::SIMPLE).c_str(), true);
-        mqttClient->publish((String(mqttBaseTopic) + F("/reboot_time")).c_str(), (bwc->reboot_time_str+'Z').c_str(), true);
+#ifdef ESP8266
+    // Diese HomeAssistant-spezifischen Publishes/Discovery nur im Custom/Home Mode
+    if (!mqttCloudMode)
+    {
+        mqttClient->publish((String(mqttBaseTopic) + F("/reboot_time")).c_str(), (bwc->reboot_time_str + 'Z').c_str(), true);
         mqttClient->publish((String(mqttBaseTopic) + F("/reboot_reason")).c_str(), ESP.getResetReason().c_str(), true);
+
         String buttonname;
         buttonname.reserve(32);
         bwc->getButtonName(buttonname);
-        mqttClient->publish((String(mqttBaseTopic) + F("/button")).c_str(), buttonname.c_str(), true);
+
+        const bool retainButton = true; // Home/Custom retained wie gewohnt
+        mqttClient->publish((String(mqttBaseTopic) + F("/button")).c_str(), buttonname.c_str(), retainButton);
+
         mqttClient->loop();
         sendMQTT();
+
         Serial.println(F("MQTT Sending HA discovery"));
         setupHA();
-        mqttClient->setBufferSize(512);
+
         mqttClient->loop();
-        // Serial.println(F("MQTT Sending config"));
-        // sendMQTTConfig();    // Stack smashing if doing this here :-(
         send_mqtt_cfg_needed = true;
         Serial.println(F("done"));
-        #endif
+    }
+#endif
+
     }
     else
     {
-        // Serial.print(F("failed, Return Code = "));
-        // Serial.println(mqttClient->state()); // states explained in webSocket->js
+        Serial.print(F("MQTT connect FAILED, state="));
+        Serial.println(mqttClient->state());
+#if defined(ESP8266)
+        if (mqtt_fail_streak < 250) mqtt_fail_streak++;
+#endif
+
+        // optional: damit du es sofort siehst, woran es grob liegt:
+        // -4 timeout, -3 lost, -2 failed, -1 disconnected, 1 bad protocol,
+        // 2 bad client id, 3 unavailable, 4 bad creds, 5 unauthorized
     }
+
     Serial.println(F("end mqttcon"));
+
+
 }
 
 time_t getBootTime()

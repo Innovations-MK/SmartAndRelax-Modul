@@ -3,6 +3,21 @@
 #include "pitches.h"
 #include <algorithm>
 
+// --- CMDQ save debounce / change-detect ---
+static uint32_t g_cmdq_last_save_ms = 0;
+static uint32_t g_cmdq_last_hash = 0;
+
+// kleine, schnelle Hash-Funktion (FNV-1a 32bit)
+static uint32_t fnv1a32(const uint8_t* data, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+
 BWC::BWC()
 {
     //Initialize variables
@@ -1498,48 +1513,80 @@ void BWC::_saveStates() {
     // // ESP.wdtEnable(0);
 }
 
-void BWC::_saveCommandQueue(){
-    _save_cmdq_needed = false;
-    //kill the dog
-    // ESP.wdtDisable();
-    #ifdef ESP8266
-    ESP.wdtFeed();
-    #endif
-    File file = LittleFS.open(F("cmdq.json"), "w");
+void BWC::_saveCommandQueue()
+{
+    // --- 1) Rate-Limit / Debounce: max 1x alle 3000 ms schreiben ---
+    const uint32_t now = millis();
+    const uint32_t MIN_SAVE_GAP_MS = 3000;
+
+    if ((uint32_t)(now - g_cmdq_last_save_ms) < MIN_SAVE_GAP_MS) {
+        // Noch zu früh -> später nochmal versuchen, Flag bleibt true
+        return;
+    }
+
+    // --- 2) "Nicht speichern" Sonderfall: Instant-Reboot ganz vorne ---
+    // WICHTIG: Das muss VOR dem File-open passieren!
+    if (_command_que.size() &&
+        _command_que[0].cmd == REBOOTESP &&
+        _command_que[0].interval == 0)
+    {
+        _save_cmdq_needed = false; // damit er nicht jede Loop wieder versucht
+        return;
+    }
+
+    // --- 3) JSON bauen und Hash vergleichen (nur schreiben, wenn geändert) ---
+    DynamicJsonDocument doc(1024);
+    doc[F("LEN")] = _command_que.size();
+
+    for (unsigned int i = 0; i < _command_que.size(); i++) {
+        doc[F("CMD")][i]      = _command_que[i].cmd;
+        doc[F("VALUE")][i]    = _command_que[i].val;
+        doc[F("XTIME")][i]    = _command_que[i].xtime;
+        doc[F("INTERVAL")][i] = _command_que[i].interval;
+        doc[F("TXT")][i]      = _command_que[i].text;
+    }
+
+    String json;
+    json.reserve(768);
+    if (serializeJson(doc, json) == 0) {
+        // konnte nicht serialisieren -> später erneut versuchen
+        return;
+    }
+
+    const uint32_t h = fnv1a32((const uint8_t*)json.c_str(), json.length());
+    if (h == g_cmdq_last_hash) {
+        // Inhalt identisch -> kein Flash-Write nötig
+        _save_cmdq_needed = false;
+        g_cmdq_last_save_ms = now; // trotzdem "beruhigen"
+        return;
+    }
+
+    // --- 4) Jetzt erst File schreiben ---
+    File file = LittleFS.open(F("/cmdq.json"), "w");
     if (!file) {
         Serial.println(F("Failed to save cmdq.json"));
         return;
-    } else {
-        Serial.println(F("Writing cmdq.json"));
-    }
-    /*Do not save instant reboot command. Don't ask me how I know.*/
-    if(_command_que.size())
-        if(_command_que[0].cmd == REBOOTESP && _command_que[0].interval == 0) return;
-    DynamicJsonDocument doc(1024);
-
-    // Set the values in the document
-    doc[F("LEN")] = _command_que.size();
-    for(unsigned int i = 0; i < _command_que.size(); i++){
-        doc[F("CMD")][i] = _command_que[i].cmd;
-        doc[F("VALUE")][i] = _command_que[i].val;
-        doc[F("XTIME")][i] = _command_que[i].xtime;
-        doc[F("INTERVAL")][i] = _command_que[i].interval;
-        doc[F("TXT")][i] = _command_que[i].text;
     }
 
-    // Serialize JSON to file
-    if (serializeJson(doc, file) == 0) {
-        // Serial.println(F("Failed to write cmdq.json"));
-    } else {
-        String s;
-        serializeJson(doc, s);
-        // Serial.println(s);
-    }
+    Serial.println(F("Writing cmdq.json"));
+
+    size_t written = file.print(json);
     file.close();
+
+    if (written == 0) {
+        // Schreiben fehlgeschlagen -> später erneut versuchen
+        Serial.println(F("cmdq.json write FAILED"));
+        return;
+    }
+
     Serial.println(F("Done!"));
-    //revive the dog
-    // ESP.wdtEnable(0);
+
+    // --- 5) Erfolg: Flags/Tracker updaten ---
+    g_cmdq_last_hash = h;
+    g_cmdq_last_save_ms = now;
+    _save_cmdq_needed = false;
 }
+
 
 void BWC::saveSettings(){
     //kill the dog
