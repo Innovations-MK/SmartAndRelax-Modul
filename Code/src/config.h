@@ -142,7 +142,7 @@ String mqttBaseTopic = DEVICE_NAME;
 int mqttTelemetryInterval = 600;
 
 // ===== SmartAndRelax Dual-MQTT Mode =====
-// true  = Cloud (TLS, DeviceID=MAC clean, Topic Prefix smartandrelax/devices/)
+// true  = Cloud (TLS, DeviceID=MAC clean, Topic /)
 // false = Custom/Local MQTT (z.B. Mosquitto / HomeAssistant)
 bool mqttCloudMode = true;
 
