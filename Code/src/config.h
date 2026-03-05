@@ -142,7 +142,7 @@ String mqttBaseTopic = DEVICE_NAME;
 int mqttTelemetryInterval = 600;
 
 // ===== SmartAndRelax Dual-MQTT Mode =====
-// true  = Cloud (TLS, DeviceID=MAC clean, Topic /)
+// true  = Cloud
 // false = Custom/Local MQTT (z.B. Mosquitto / HomeAssistant)
 bool mqttCloudMode = true;
 
@@ -150,10 +150,10 @@ bool mqttCloudMode = true;
 String mqttPairingCode = "";
 
 // ===== Cloud Defaults =====
-//static const char* SAR_HOST = "***";
-//static const uint16_t SAR_PORT = 8883;
-//static const char* SAR_USER = "**";
+//static const char* SAR_HOST = ***;
+//static const uint16_t SAR_PORT = ***;
+//static const char* SAR_USER = **;
 //Passwort:
-//static const char* SAR_PASS = "***";
+//static const char* SAR_PASS = ***;
 
-//static const char* SAR_TOPIC_PREFIX = "***";
+//static const char* SAR_TOPIC_PREFIX = ***;
