@@ -1592,7 +1592,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len)
             item.xtime = xtime;
             item.interval = interval;
             item.text = txt;
-            bwc->add_command(item);
+            if (bwc)
+            {
+                // Manual HEAT/PUMP control from the main page overrides Smart Schedule.
+                bwc->handleSmartScheduleWebOverride(command);
+                bwc->add_command(item);
+            }
         }
         break;
 
@@ -1605,6 +1610,11 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len)
  * start a HTTP server with a file read and upload handler
  */
 void handleDiag();
+
+void handleGetSmartSchedule();
+void handleSetSmartSchedule();
+void handleUpdateSmartSchedule();
+void handleCancelSmartSchedule();
 
 void startHttpServer()
 {
@@ -1627,6 +1637,10 @@ void startHttpServer()
         server->on(F("/addcommand/"), handleAddCommand);
         server->on(F("/editcommand/"), handleEditCommand);
         server->on(F("/delcommand/"), handleDelCommand);
+        server->on(F("/getsmartschedule/"), HTTP_POST, handleGetSmartSchedule);
+        server->on(F("/setsmartschedule/"), HTTP_POST, handleSetSmartSchedule);
+        server->on(F("/updatesmartschedule/"), HTTP_POST, handleUpdateSmartSchedule);
+        server->on(F("/cancelsmartschedule/"), HTTP_POST, handleCancelSmartSchedule);
         server->on(F("/getwebconfig/"), handleGetWebConfig);
         server->on(F("/setwebconfig/"), handleSetWebConfig);
         server->on(F("/getwifi/"), handleGetWifi);
@@ -1978,6 +1992,41 @@ void handleDiag()
     server->send(200, F("text/html; charset=utf-8"), out);
 }
 
+
+void handleGetSmartSchedule()
+{
+    if(!bwc) { server->send(503, F("text/plain"), F("Service Unavailable")); return; }
+    String json; json.reserve(768); bwc->getJSONSmartSchedule(json);
+    server->send(200, F("application/json"), json);
+}
+
+void handleSetSmartSchedule()
+{
+    if(!bwc) { server->send(503, F("text/plain"), F("Service Unavailable")); return; }
+    StaticJsonDocument<256> doc;
+    if(deserializeJson(doc, server->arg(0))) { server->send(400, F("text/plain"), F("Invalid JSON")); return; }
+    uint64_t targetTime = doc[F("TARGETTIME")] | 0ULL;
+    uint8_t targetTemp = doc[F("TARGETTEMP")] | 0;
+    bool keepOn = doc[F("KEEPON")] | false;
+    int poolCapacity = doc[F("POOLCAP")] | 0;
+    if(bwc->setSmartSchedule(targetTime, targetTemp, keepOn, poolCapacity)) server->send(200, F("text/plain"), F("ok"));
+    else server->send(400, F("text/plain"), F("Ungueltige Werte oder Uhrzeit nicht synchronisiert"));
+}
+
+void handleUpdateSmartSchedule()
+{
+    if(!bwc) { server->send(503, F("text/plain"), F("Service Unavailable")); return; }
+    StaticJsonDocument<128> doc;
+    if(deserializeJson(doc, server->arg(0)) || !doc.containsKey(F("KEEPON"))) { server->send(400, F("text/plain"), F("Invalid JSON")); return; }
+    if(bwc->updateSmartScheduleKeepHeaterOn(doc[F("KEEPON")])) server->send(200, F("text/plain"), F("ok"));
+    else server->send(404, F("text/plain"), F("Kein aktiver Zeitplan"));
+}
+
+void handleCancelSmartSchedule()
+{
+    if(!bwc) { server->send(503, F("text/plain"), F("Service Unavailable")); return; }
+    bwc->cancelSmartSchedule(); server->send(200, F("text/plain"), F("ok"));
+}
 
 void handleGetConfig()
 {

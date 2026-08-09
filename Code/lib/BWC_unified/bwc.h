@@ -49,6 +49,25 @@ struct command_que_item
     String text = "";
 };
 
+
+struct smart_schedule_t
+{
+    bool active = false;
+    uint64_t target_time = 0;
+    uint8_t target_temp = 37;
+    bool keep_heater_on = false;
+    uint64_t calculated_start_time = 0;
+    uint64_t next_check_time = 0;
+    float last_heating_estimate = 0.0f;
+    uint8_t temp_reading_state = 0;
+    uint64_t temp_reading_timer = 0;
+    bool temp_reading_started_pump = false;
+    uint8_t accurate_temperature = 0;
+    bool check_completed = false;
+    bool target_temp_reached = false;
+    bool heater_started_by_schedule = false;
+};
+
 class BWC {
 
     public:
@@ -91,6 +110,11 @@ class BWC {
         String getModel();
         void print(const String& txt);
         void loadCommandQueue();
+        bool setSmartSchedule(uint64_t target_time, uint8_t target_temp, bool keep_heater_on, int pool_capacity = 0);
+        bool updateSmartScheduleKeepHeaterOn(bool keep_heater_on);
+        void cancelSmartSchedule();
+        void handleSmartScheduleWebOverride(Commands cmd);
+        void getJSONSmartSchedule(String &rtn);
 
         // String getDebugData();
 
@@ -130,6 +154,14 @@ class BWC {
         void _beep();
         void _accord();
         void _log();
+        void _handleSmartSchedule();
+        void _handleSmartSchedulePanelOverride();
+        void _startAccurateTempReading();
+        void _processAccurateTempReading();
+        float _calculateHeatingTime(uint8_t current_temp, uint8_t target_temp);
+        void _loadSmartSchedule();
+        void _saveSmartSchedule();
+        void _resetSmartScheduleState();
 
     private:
         uint64_t _timestamp_secs; // seconds
@@ -188,6 +220,10 @@ class BWC {
         bool _dsp_tgt_used = true;
         bool _notify;
         bool _vt_calibrated = false;
+
+        smart_schedule_t _smart_schedule;
+        int _pool_capacity = 700;
+        bool _save_smartschedule_needed = false;
 };
 
 void save_settings_cb(BWC *bwcInstance);

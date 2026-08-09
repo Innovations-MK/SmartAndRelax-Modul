@@ -186,6 +186,7 @@ void BWC::begin(){
     loadCommandQueue();
     _loadSettings();
     _restoreStates();
+    _loadSmartSchedule();
 }
 
 
@@ -213,6 +214,7 @@ void BWC::loop(){
 
     dsp->handleStates();                //transmits to dsp if serial received from cio
     dsp->updateToggles();               //checking serial line
+    _handleSmartSchedulePanelOverride();
     cio->cio_toggles = dsp->dsp_toggles;
 
     play_sound();
@@ -229,6 +231,7 @@ void BWC::loop(){
     
     /*following method will change target temp and set _dsp_tgt_used to false if target temp is changed*/
     _handleCommandQ();
+    _handleSmartSchedule();
 
     /*If new target was not set above, use whatever the cio says*/
     cio->setRawPayload(dsp->getRawPayload());
@@ -238,6 +241,7 @@ void BWC::loop(){
     if(_save_settings_needed) saveSettings();
     if(_save_cmdq_needed) _saveCommandQueue();
     if(_save_states_needed) _saveStates();
+    if(_save_smartschedule_needed) _saveSmartSchedule();
     _handleNotification();
     _handleStateChanges();
     _calcVirtualTemp();
@@ -963,6 +967,7 @@ void BWC::getJSONStates(String &rtn) {
     {
         //celsius
         doc[F("AMB")] = _ambient_temp;
+    doc[F("POOLCAP")] = _pool_capacity;
         doc[F("VTM")] = _virtual_temp;
         doc[F("TGTC")] = cio->cio_states.target;
         doc[F("TMPC")] = cio->cio_states.temperature;
@@ -1064,6 +1069,7 @@ void BWC::getJSONSettings(String &rtn){
     doc[F("MODEL")] = cio->getModel();
     doc[F("NOTIFY")] = _notify;
     doc[F("NOTIFTIME")] = _notification_time;
+    doc[F("POOLCAP")] = _pool_capacity;
     doc[F("VTCAL")] = _vt_calibrated;
 
     doc[F("LCK")] = dsp->EnabledButtons[LOCK];
@@ -1145,6 +1151,7 @@ void BWC::setJSONSettings(const String& message){
     _notify = doc[F("NOTIFY")] | _notify;
     _notification_time = doc[F("NOTIFTIME")] | _notification_time;
     _vt_calibrated = doc[F("VTCAL")] | _vt_calibrated;
+    if(doc.containsKey(F("POOLCAP"))) { int v = doc[F("POOLCAP")]; if(v >= 100 && v <= 3000) _pool_capacity = v; }
     dsp->EnabledButtons[LOCK] = doc[F("LCK")] | dsp->EnabledButtons[LOCK];
     dsp->EnabledButtons[TIMER] = doc[F("TMR")] | dsp->EnabledButtons[TIMER];
     dsp->EnabledButtons[BUBBLES] = doc[F("AIR")] | dsp->EnabledButtons[BUBBLES];
@@ -1346,6 +1353,8 @@ void BWC::_loadSettings(){
     _ambient_temp = doc[F("AMB")] | 20;
     _dsp_brightness = doc[F("BRT")] | 7;
     _vt_calibrated = doc[F("VTCAL")] | false;
+    _pool_capacity = doc[F("POOLCAP")] | 700;
+    if(_pool_capacity < 100 || _pool_capacity > 3000) _pool_capacity = 700;
 
     dsp->EnabledButtons[LOCK] = doc[F("LCK")];
     dsp->EnabledButtons[TIMER] = doc[F("TMR")];
@@ -1808,4 +1817,206 @@ void BWC::_accord()
         n.frequency_hz = NOTE_E6;
         _notes.push_back(n);
     }
+}
+
+// --- Smart Schedule (predictive heating) ---
+bool BWC::setSmartSchedule(uint64_t target_time, uint8_t target_temp, bool keep_heater_on, int pool_capacity)
+{
+    const uint64_t now = (uint64_t)time(nullptr);
+    if(now < 57600ULL || target_time <= now || target_temp < 20 || target_temp > 40) return false;
+    if(pool_capacity != 0) { if(pool_capacity < 100 || pool_capacity > 3000) return false; _pool_capacity = pool_capacity; _save_settings_needed = true; }
+    _smart_schedule = smart_schedule_t();
+    _smart_schedule.active = true;
+    _smart_schedule.target_time = target_time;
+    _smart_schedule.target_temp = target_temp;
+    _smart_schedule.keep_heater_on = keep_heater_on;
+    uint8_t cur = cio ? cio->cio_states.temperature : 20;
+    if(cio && !cio->cio_states.unit) cur = (uint8_t)round(F2C(cur));
+    _smart_schedule.last_heating_estimate = _calculateHeatingTime(cur, target_temp);
+    _save_smartschedule_needed = true; _new_data_available = true;
+    return true;
+}
+
+bool BWC::updateSmartScheduleKeepHeaterOn(bool keep)
+{
+    if(!_smart_schedule.active) return false;
+    _smart_schedule.keep_heater_on = keep; _save_smartschedule_needed = true; _new_data_available = true; return true;
+}
+
+void BWC::_resetSmartScheduleState()
+{
+    _smart_schedule = smart_schedule_t(); _save_smartschedule_needed = true; _new_data_available = true;
+}
+
+void BWC::cancelSmartSchedule()
+{
+    if(_smart_schedule.heater_started_by_schedule && cio && cio->cio_states.heat) { command_que_item i{0,0,SETHEATER,0,""}; add_command(i); }
+    if(_smart_schedule.temp_reading_started_pump && cio && cio->cio_states.pump && !cio->cio_states.heat) { command_que_item i{0,0,SETPUMP,0,""}; add_command(i); }
+    _resetSmartScheduleState();
+}
+
+void BWC::handleSmartScheduleWebOverride(Commands cmd)
+{
+    if(!_smart_schedule.active) return;
+
+    // Die Schalter auf der Hauptseite sind genauso eine bewusste manuelle
+    // Bedienung wie ein Tastendruck am Pumpenpanel. HEAT und PUMP beenden
+    // deshalb einen aktiven Smart Schedule, bevor der Web-Befehl in die
+    // normale Befehlswarteschlange aufgenommen wird. Dadurch kann ein bereits
+    // wartender automatischer EIN-Befehl den manuellen Wunsch nicht direkt
+    // wieder ueberschreiben.
+    if(cmd != SETHEATER && cmd != SETPUMP) return;
+
+    _command_que.erase(std::remove_if(_command_que.begin(), _command_que.end(),
+        [this](const command_que_item& item){
+            const bool immediateInternal =
+                (item.interval == 0 && item.xtime == 0 && item.text.length() == 0);
+            if(!immediateInternal) return false;
+            if(item.cmd == SETHEATER && item.val == 1) return true;
+            if(item.cmd == SETTARGET && item.val == _smart_schedule.target_temp) return true;
+            if(item.cmd == SETPUMP && item.val == 1) return true;
+            return false;
+        }),
+        _command_que.end());
+
+    _save_cmdq_needed = true;
+
+    // Kein zusaetzlicher AUS-Befehl: Der unmittelbar folgende Web-Befehl
+    // setzt den vom Benutzer gewaehlten Zustand selbst. Ein zweiter Toggle
+    // koennte sonst den Zustand wieder umkehren.
+    _resetSmartScheduleState();
+}
+
+float BWC::_calculateHeatingTime(uint8_t current_temp, uint8_t target_temp)
+{
+    if(current_temp >= target_temp) return 0.0f;
+    const float heaterPwr=2000.0f, heatLoss=4.85f, cp=1.163f;
+    const float avg=((float)current_temp+(float)target_temp)/2.0f;
+    float efficiency=0.99f-((avg-(float)_ambient_temp)*0.005f);
+    if(efficiency<0.10f) efficiency=0.10f; if(efficiency>0.99f) efficiency=0.99f;
+    const float net=heaterPwr*efficiency-heatLoss*(avg-(float)_ambient_temp);
+    if(net<=0.0f) return 999.0f;
+    return ((float)_pool_capacity*cp*((float)target_temp-(float)current_temp))/net;
+}
+
+void BWC::_startAccurateTempReading()
+{
+    if(!cio) return;
+    _smart_schedule.temp_reading_started_pump = false;
+    if(!cio->cio_states.pump) { command_que_item i{1,0,SETPUMP,0,""}; add_command(i); _smart_schedule.temp_reading_started_pump=true; }
+    _smart_schedule.temp_reading_state=1; _smart_schedule.temp_reading_timer=_timestamp_secs+20;
+}
+
+void BWC::_processAccurateTempReading()
+{
+    if(!cio) return;
+    if(_smart_schedule.temp_reading_state==1) {
+        if(_timestamp_secs < _smart_schedule.temp_reading_timer) return;
+        uint8_t t=cio->cio_states.temperature; if(!cio->cio_states.unit) t=(uint8_t)round(F2C(t));
+        _smart_schedule.accurate_temperature=t; _smart_schedule.temp_reading_state=2; return;
+    }
+    if(_smart_schedule.temp_reading_state!=2) return;
+    if(_smart_schedule.temp_reading_started_pump && cio->cio_states.pump && !cio->cio_states.heat) { command_que_item i{0,0,SETPUMP,0,""}; add_command(i); }
+    const float hours=_calculateHeatingTime(_smart_schedule.accurate_temperature,_smart_schedule.target_temp);
+    _smart_schedule.last_heating_estimate=hours;
+    float buffer=hours*0.10f; if(buffer<1.0f) buffer=1.0f;
+    uint64_t needed=(uint64_t)((hours+buffer)*3600.0f);
+    uint64_t remaining=_smart_schedule.target_time>_timestamp_secs?_smart_schedule.target_time-_timestamp_secs:0;
+    if(needed>=remaining) { _smart_schedule.calculated_start_time=_timestamp_secs; _smart_schedule.check_completed=true; }
+    else {
+        _smart_schedule.calculated_start_time=_smart_schedule.target_time-needed;
+        uint64_t until=_smart_schedule.calculated_start_time-_timestamp_secs;
+        uint64_t interval=until>86400ULL?43200ULL:until/2ULL; if(interval<300ULL) interval=300ULL;
+        uint64_t proposed=_timestamp_secs+interval;
+        if(proposed>=_smart_schedule.calculated_start_time) { _smart_schedule.check_completed=true; _smart_schedule.next_check_time=_smart_schedule.calculated_start_time; }
+        else { _smart_schedule.check_completed=false; _smart_schedule.next_check_time=proposed; }
+    }
+    _smart_schedule.temp_reading_state=0; _smart_schedule.temp_reading_started_pump=false;
+    _save_smartschedule_needed=true; _new_data_available=true;
+}
+
+void BWC::_handleSmartSchedulePanelOverride()
+{
+    if(!_smart_schedule.active || dsp == nullptr) return;
+
+    const Buttons button = dsp->dsp_toggles.pressed_button;
+
+    // Ein echter Tastendruck am Pumpenpanel hat immer Vorrang vor Smart
+    // Schedule. HEAT beendet den Zeitplan direkt. PUMP und POWER beenden ihn
+    // ebenfalls, sobald der Heizbetrieb bereits begonnen hat bzw. unmittelbar
+    // bevorsteht. Dadurch kann Smart Schedule den manuellen AUS-Wunsch nicht
+    // im selben oder naechsten Loop wieder mit SETHEATER=1 ueberschreiben.
+    const bool heatOverride = (button == HEAT) || dsp->dsp_toggles.heat_change;
+    const bool pumpOverride = (button == PUMP) || dsp->dsp_toggles.pump_change;
+    const bool powerOverride = (button == POWER) || dsp->dsp_toggles.power_change;
+    const bool heatingPhase = _smart_schedule.heater_started_by_schedule ||
+                              (_smart_schedule.calculated_start_time != 0 &&
+                               _timestamp_secs >= _smart_schedule.calculated_start_time);
+
+    if(!heatOverride && !(heatingPhase && (pumpOverride || powerOverride))) return;
+
+    // Bereits wartende, sofortige Smart-Schedule-/Restore-EIN-Befehle entfernen.
+    // Ohne diese Bereinigung koennte ein kurz zuvor eingereihter SETHEATER=1
+    // den physischen Tastendruck direkt wieder rueckgaengig machen.
+    _command_que.erase(std::remove_if(_command_que.begin(), _command_que.end(),
+        [this](const command_que_item& item){
+            const bool immediateInternal = (item.interval == 0 && item.xtime == 0 && item.text.length() == 0);
+            if(!immediateInternal) return false;
+            if(item.cmd == SETHEATER && item.val == 1) return true;
+            if(item.cmd == SETTARGET && item.val == _smart_schedule.target_temp) return true;
+            if(item.cmd == SETPUMP && item.val == 1) return true;
+            return false;
+        }),
+        _command_que.end());
+    _save_cmdq_needed = true;
+
+    // Nur den Smart-Schedule-Zustand verwerfen. Kein zusaetzlicher AUS-Befehl:
+    // Der aktuelle physische Tastendruck wird direkt danach unveraendert an die
+    // Pumpenelektronik weitergereicht. Ein zweiter Toggle waere hier falsch.
+    _resetSmartScheduleState();
+}
+
+void BWC::_handleSmartSchedule()
+{
+    if(!_smart_schedule.active || !cio) return;
+    if(_timestamp_secs >= _smart_schedule.target_time) {
+        if(!_smart_schedule.keep_heater_on && _smart_schedule.heater_started_by_schedule && cio->cio_states.heat) { command_que_item i{0,0,SETHEATER,0,""}; add_command(i); }
+        _resetSmartScheduleState(); return;
+    }
+    uint8_t temp=cio->cio_states.temperature; if(!cio->cio_states.unit) temp=(uint8_t)round(F2C(temp));
+    if(!_smart_schedule.keep_heater_on && _smart_schedule.heater_started_by_schedule && temp>=_smart_schedule.target_temp) {
+        if(cio->cio_states.heat) { command_que_item i{0,0,SETHEATER,0,""}; add_command(i); }
+        _smart_schedule.target_temp_reached=true; _save_smartschedule_needed=true; return;
+    }
+    if(_smart_schedule.temp_reading_state) { _processAccurateTempReading(); return; }
+    if(_smart_schedule.calculated_start_time && _timestamp_secs>=_smart_schedule.calculated_start_time) {
+        if(!cio->cio_states.heat && !_smart_schedule.target_temp_reached) {
+            command_que_item t{_smart_schedule.target_temp,0,SETTARGET,0,""}; add_command(t);
+            command_que_item h{1,0,SETHEATER,0,""}; add_command(h);
+            _smart_schedule.heater_started_by_schedule=true; _smart_schedule.check_completed=true; _save_smartschedule_needed=true;
+        }
+        return;
+    }
+    if(!_smart_schedule.check_completed && _timestamp_secs>=_smart_schedule.next_check_time) _startAccurateTempReading();
+}
+
+void BWC::getJSONSmartSchedule(String &rtn)
+{
+    StaticJsonDocument<1024> d; d[F("CONTENT")]=F("SMARTSCHEDULE"); d[F("ACTIVE")]=_smart_schedule.active; d[F("TARGETTIME")]=_smart_schedule.target_time; d[F("TARGETTEMP")]=_smart_schedule.target_temp; d[F("KEEPON")]=_smart_schedule.keep_heater_on; d[F("STARTTIME")]=_smart_schedule.calculated_start_time; d[F("NEXTCHECK")]=_smart_schedule.next_check_time; d[F("ESTIMATE")]=_smart_schedule.last_heating_estimate;
+    float b=0; if(_smart_schedule.last_heating_estimate>0 && _smart_schedule.last_heating_estimate<999){b=_smart_schedule.last_heating_estimate*.10f;if(b<1)b=1;} d[F("BUFFER")]=b; d[F("ESTIMATED_KWH")]=_smart_schedule.last_heating_estimate>0?_smart_schedule.last_heating_estimate*2.0f:0; d[F("ESTIMATED_COST")]=(_smart_schedule.last_heating_estimate>0?_smart_schedule.last_heating_estimate*2.0f*(float)_price:0); d[F("CHECKCOMPLETED")]=_smart_schedule.check_completed; d[F("CURRENTTIME")]=_timestamp_secs;
+    uint8_t temp=cio?cio->cio_states.temperature:0, target=cio?cio->cio_states.target:0; if(cio && !cio->cio_states.unit){temp=(uint8_t)round(F2C(temp));target=(uint8_t)round(F2C(target));} d[F("CURRENTTEMP")]=temp; d[F("GLOBALTARGET")]=target; d[F("ACCURATETEMP")]=_smart_schedule.accurate_temperature?_smart_schedule.accurate_temperature:temp; d[F("HEATER")]=cio?cio->cio_states.heat:0; d[F("PUMP")]=cio?cio->cio_states.pump:0; d[F("READING_STATE")]=_smart_schedule.temp_reading_state; d[F("POOLCAP")]=_pool_capacity; d[F("AMBIENTTEMP")]=_ambient_temp; d[F("TIMEREMAINING")]=(int64_t)_smart_schedule.target_time-(int64_t)_timestamp_secs; d[F("TIMEUNTILSTART")]=(int64_t)_smart_schedule.calculated_start_time-(int64_t)_timestamp_secs;
+    float rem=-1; if(cio && cio->cio_states.heat) rem=temp>=_smart_schedule.target_temp?0:_calculateHeatingTime(temp,_smart_schedule.target_temp); d[F("REMAINING_HEATING_TIME")]=rem;
+    char f[16]=""; if(_smart_schedule.last_heating_estimate>0&&_smart_schedule.last_heating_estimate<999){int m=(int)(_smart_schedule.last_heating_estimate*60);snprintf(f,sizeof(f),"%02d:%02d",m/60,m%60);} d[F("ESTIMATE_FMT")]=f; serializeJson(d,rtn);
+}
+
+void BWC::_loadSmartSchedule()
+{
+    File f=LittleFS.open(F("/smartschedule.json"),"r"); if(!f)return; StaticJsonDocument<512>d; if(deserializeJson(d,f)){f.close();return;} f.close();
+    _smart_schedule.active=d[F("ACTIVE")]|false; _smart_schedule.target_time=d[F("TARGETTIME")]|0ULL; _smart_schedule.target_temp=d[F("TARGETTEMP")]|37; _smart_schedule.keep_heater_on=d[F("KEEPON")]|false; _smart_schedule.calculated_start_time=d[F("STARTTIME")]|0ULL; _smart_schedule.next_check_time=d[F("NEXTCHECK")]|0ULL; _smart_schedule.last_heating_estimate=d[F("ESTIMATE")]|0.0f; _smart_schedule.accurate_temperature=d[F("ACCURATETEMP")]|0; _smart_schedule.check_completed=d[F("CHECKCOMPLETED")]|false; _smart_schedule.heater_started_by_schedule=d[F("HEATEROWNED")]|false;
+    _smart_schedule.temp_reading_state=0; _smart_schedule.temp_reading_started_pump=false; if(_smart_schedule.active && _smart_schedule.target_time<=(uint64_t)time(nullptr)) _smart_schedule.active=false;
+}
+
+void BWC::_saveSmartSchedule()
+{
+    _save_smartschedule_needed=false; File f=LittleFS.open(F("/smartschedule.json"),"w"); if(!f)return; StaticJsonDocument<512>d; d[F("ACTIVE")]=_smart_schedule.active; d[F("TARGETTIME")]=_smart_schedule.target_time; d[F("TARGETTEMP")]=_smart_schedule.target_temp; d[F("KEEPON")]=_smart_schedule.keep_heater_on; d[F("STARTTIME")]=_smart_schedule.calculated_start_time; d[F("NEXTCHECK")]=_smart_schedule.next_check_time; d[F("ESTIMATE")]=_smart_schedule.last_heating_estimate; d[F("ACCURATETEMP")]=_smart_schedule.accurate_temperature; d[F("CHECKCOMPLETED")]=_smart_schedule.check_completed; d[F("HEATEROWNED")]=_smart_schedule.heater_started_by_schedule; serializeJson(d,f); f.close();
 }

@@ -1,361 +1,430 @@
 /*
- * SmartAndRelax – Smart Schedule user interface
- * Independent implementation for the SmartAndRelax HTTP API.
+ * SmartAndRelax - Smart Schedule
  *
- * Expected endpoints:
- *   POST /getsmartschedule/
- *   POST /setsmartschedule/
- *   POST /updatesmartschedule/
- *   POST /cancelsmartschedule/
- *   POST /getconfig/
+ * This file contains portions based on and adapted from the Smart Schedule implementation
+ * of the GPL-3.0 licensed WifiWhirl project:
+ * https://github.com/WifiWhirl/WifiWhirl-Software
+ *
+ * SmartAndRelax modifications by Michael Krenner / MK-Innovations.
+ * Modified for SmartAndRelax firmware 3.1.5, 2026-07-20.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the repository root for details.
  */
-(function () {
-  "use strict";
 
-  const POLL_INTERVAL_MS = 5000;
-  const API = Object.freeze({
-    status: "/getsmartschedule/",
-    create: "/setsmartschedule/",
-    update: "/updatesmartschedule/",
-    cancel: "/cancelsmartschedule/",
-    config: "/getconfig/",
-  });
+/**
+ * Smart Schedule
+ * Handles UI interaction and communication with the SmartAndRelax firmware
+ */
 
-  let pollHandle = 0;
-  let requestRunning = false;
+let scheduleUpdateInterval = null;
 
-  function byId(id) {
-    return document.getElementById(id);
-  }
+/**
+ * Load smart schedule on page load
+ */
+function loadSmartSchedule() {
+  // Set default datetime to today at 19:00
+  const today = new Date();
+  const year = today.getFullYear();
+  const month = String(today.getMonth() + 1).padStart(2, "0");
+  const day = String(today.getDate()).padStart(2, "0");
+  document.getElementById("targetDateTime").value =
+    year + "-" + month + "-" + day + "T19:00";
 
-  function setText(id, value) {
-    const node = byId(id);
-    if (node) node.textContent = value;
-  }
+  // Fetch current global target temperature and set as default
+  fetchGlobalTargetTemp();
+  fetchPoolCapacity();
 
-  function setHtml(id, value) {
-    const node = byId(id);
-    if (node) node.innerHTML = value;
-  }
+  // Start updating schedule status
+  updateScheduleStatus();
+  scheduleUpdateInterval = setInterval(updateScheduleStatus, 5000); // Update every 5 seconds
+}
 
-  function show(id, visible, displayMode) {
-    const node = byId(id);
-    if (node) node.style.display = visible ? (displayMode || "block") : "none";
-  }
+/**
+ * Fetch global target temperature to pre-fill the form
+ */
+function fetchGlobalTargetTemp() {
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/getsmartschedule/", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
 
-  function numeric(value, fallback) {
-    const result = Number(value);
-    return Number.isFinite(result) ? result : fallback;
-  }
-
-  async function postJson(url, payload) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload || {}),
-      cache: "no-store",
-    });
-
-    if (!response.ok) {
-      const message = (await response.text()).trim();
-      throw new Error(message || ("HTTP " + response.status));
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4 && xhr.status === 200) {
+      try {
+        const data = JSON.parse(xhr.responseText);
+        // Set global target temperature as default for new schedules
+        if (data.GLOBALTARGET && data.GLOBALTARGET > 0) {
+          document.getElementById("targetTemp").value = data.GLOBALTARGET;
+        }
+      } catch (e) {
+        console.error("Failed to fetch global target:", e);
+      }
     }
+  };
 
-    const type = response.headers.get("content-type") || "";
-    return type.indexOf("application/json") >= 0
-      ? response.json()
-      : response.text();
-  }
+  xhr.send("{}");
+}
 
-  function twoDigits(value) {
-    return String(value).padStart(2, "0");
-  }
 
-  function localDateTimeInput(date) {
-    return (
-      date.getFullYear() +
-      "-" + twoDigits(date.getMonth() + 1) +
-      "-" + twoDigits(date.getDate()) +
-      "T" + twoDigits(date.getHours()) +
-      ":" + twoDigits(date.getMinutes())
-    );
-  }
-
-  function germanDateTime(unixSeconds) {
-    const timestamp = numeric(unixSeconds, 0);
-    if (timestamp <= 0) return "--";
-    return new Date(timestamp * 1000).toLocaleString("de-DE", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }
-
-  function duration(seconds) {
-    let remaining = Math.max(0, Math.round(numeric(seconds, 0)));
-    const days = Math.floor(remaining / 86400);
-    remaining %= 86400;
-    const hours = Math.floor(remaining / 3600);
-    remaining %= 3600;
-    const minutes = Math.floor(remaining / 60);
-    const secs = remaining % 60;
-
-    const parts = [];
-    if (days) parts.push(days + (days === 1 ? " Tag" : " Tage"));
-    if (hours || days) parts.push(hours + " Std.");
-    parts.push(minutes + " Min.");
-    if (!days && !hours && minutes < 5) parts.push(secs + " Sek.");
-    return parts.join(" ");
-  }
-
-  function countdown(value) {
-    const seconds = numeric(value, 0);
-    return seconds > 0 ? duration(seconds) : "Jetzt";
-  }
-
-  function initializeFormDefaults() {
-    const target = byId("targetDateTime");
-    if (target && !target.value) {
-      const next = new Date();
-      next.setHours(19, 0, 0, 0);
-      if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
-      target.value = localDateTimeInput(next);
-      target.min = localDateTimeInput(new Date(Date.now() + 60000));
+function fetchPoolCapacity() {
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/getconfig/", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4 && xhr.status === 200) {
+      try {
+        const data = JSON.parse(xhr.responseText);
+        if (data.POOLCAP >= 100 && data.POOLCAP <= 3000)
+          document.getElementById("poolCapacity").value = data.POOLCAP;
+      } catch (e) {}
     }
-  }
+  };
+  xhr.send("{}");
+}
 
-  function updateInactiveForm(status) {
-    const targetTemp = numeric(status.GLOBALTARGET, 0);
-    if (targetTemp >= 20 && targetTemp <= 40) {
-      const input = byId("targetTemp");
-      if (input && !input.dataset.userChanged) input.value = targetTemp;
+/**
+ * Update schedule status display
+ */
+function updateScheduleStatus() {
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/getsmartschedule/", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4 && xhr.status === 200) {
+      try {
+        const data = JSON.parse(xhr.responseText);
+        displayScheduleStatus(data);
+      } catch (e) {
+        console.error("Failed to parse schedule data:", e);
+      }
     }
+  };
 
-    const capacity = numeric(status.POOLCAP, 0);
-    if (capacity >= 100 && capacity <= 3000) {
-      const input = byId("poolCapacity");
-      if (input && !input.dataset.userChanged) input.value = capacity;
-    }
-  }
+  xhr.send("{}");
+}
 
-  function renderEstimate(status) {
-    const estimate = numeric(status.ESTIMATE, 0);
-    const buffer = numeric(status.BUFFER, 0);
-    const kwh = numeric(status.ESTIMATED_KWH, 0);
-    const cost = numeric(status.ESTIMATED_COST, 0);
+/**
+ * Display schedule status in UI
+ */
+function displayScheduleStatus(data) {
+  const isActive = data.ACTIVE || false;
 
-    if (estimate >= 999) {
-      setHtml("statusEstimate", '<span style="color:#ff9800">Unter den aktuellen Bedingungen nicht berechenbar</span>');
-      setText("statusBuffer", "--");
-      setText("statusCost", "--");
-      return;
-    }
+  // Show/hide sections based on active state
+  document.getElementById("statusActive").style.display = isActive
+    ? "block"
+    : "none";
+  document.getElementById("statusInactive").style.display = isActive
+    ? "none"
+    : "block";
 
-    if (estimate <= 0) {
-      setText("statusEstimate", "Zieltemperatur bereits erreicht");
-      setText("statusBuffer", "--");
-      setText("statusCost", "0,00 € (0,00 kWh)");
-      return;
-    }
+  if (isActive) {
+    // Update status fields
+    document.getElementById("statusTargetTemp").textContent =
+      data.TARGETTEMP || "--";
+    document.getElementById("statusCurrentTemp").textContent =
+      data.CURRENTTEMP || "--";
+    document.getElementById("statusAccurateTemp").textContent =
+      data.ACCURATETEMP && data.ACCURATETEMP > 0
+        ? data.ACCURATETEMP + " °C"
+        : "Wird gemessen...";
 
-    setText("statusEstimate", duration(estimate * 3600));
-    setText("statusBuffer", buffer > 0 ? duration(buffer * 3600) : "--");
-    setText(
-      "statusCost",
-      kwh > 0
-        ? cost.toFixed(2).replace(".", ",") + " € (" + kwh.toFixed(2).replace(".", ",") + " kWh)"
-        : "--"
-    );
-  }
-
-  function renderRemainingHeating(status) {
-    const rowVisible = Boolean(status.HEATER) || numeric(status.ESTIMATE, 0) <= 0;
-    show("statusRemainingRow", rowVisible, "table-row");
-    if (!rowVisible) return;
-
-    const remaining = numeric(status.REMAINING_HEATING_TIME, -1);
-    if (remaining === 0 || numeric(status.ESTIMATE, 0) <= 0) {
-      setHtml("statusRemaining", '<span style="color:#4caf50">Zieltemperatur bereits erreicht</span>');
-    } else if (remaining >= 999) {
-      setHtml("statusRemaining", '<span style="color:#ff9800">Berechnung nicht möglich</span>');
-    } else if (remaining > 0) {
-      setText("statusRemaining", duration(remaining * 3600));
+    // Display heating estimate (raw, without buffer)
+    if (data.ESTIMATE >= 999) {
+      document.getElementById("statusEstimate").innerHTML =
+        '<span style="color: #ff9800;">Aufheizen unter diesen Bedingungen nicht berechenbar</span>';
+      document.getElementById("statusBuffer").textContent = "--";
+      document.getElementById("statusCost").textContent = "--";
+    } else if (data.ESTIMATE > 0) {
+      var estimateSeconds = Math.round(data.ESTIMATE * 3600);
+      document.getElementById("statusEstimate").textContent =
+        formatDuration(estimateSeconds);
+      // Display safety buffer
+      var bufferSeconds = Math.round((data.BUFFER || 0) * 3600);
+      document.getElementById("statusBuffer").textContent =
+        bufferSeconds > 0 ? formatDuration(bufferSeconds) : "--";
+      var estimatedKwh = Number(data.ESTIMATED_KWH || 0);
+      var estimatedCost = Number(data.ESTIMATED_COST || 0);
+      document.getElementById("statusCost").textContent =
+        estimatedKwh > 0
+          ? estimatedCost.toFixed(2) + " € (" + estimatedKwh.toFixed(2) + " kWh)"
+          : "--";
     } else {
-      setText("statusRemaining", "--");
-    }
-  }
-
-  function renderOperatingState(status) {
-    if (status.HEATER) {
-      setHtml("statusHeater", '<span style="color:#4caf50;font-weight:bold">🔥 EIN</span>');
-      setHtml("statusReadingStateText", '<span style="color:#4caf50;font-weight:bold">🔥 Automatisches Aufheizen läuft.</span>');
-      show("statusReadingState", true, "table-row");
-      return;
+      document.getElementById("statusEstimate").textContent =
+        "Zieltemperatur bereits erreicht";
+      document.getElementById("statusBuffer").textContent = "--";
+      document.getElementById("statusCost").textContent = "0,00 € (0,00 kWh)";
     }
 
-    setHtml("statusHeater", '<span style="color:#999">AUS</span>');
-    const readingState = Math.trunc(numeric(status.READING_STATE, 0));
-    const messages = {
-      1: "⚙️ Temperaturmessung wird vorbereitet",
-      2: "⚙️ Wassertemperatur wird übernommen",
-    };
+    document.getElementById("activeKeepHeaterOn").value = data.KEEPON
+      ? "true"
+      : "false";
 
-    if (messages[readingState]) {
-      setHtml("statusReadingStateText", '<span style="color:#2196f3;font-weight:bold">' + messages[readingState] + "</span>");
-      show("statusReadingState", true, "table-row");
+    // Display remaining heating time (live countdown while heater is running)
+    // Use the same dynamic calculation as the dashboard ("Bereit in" / T2R)
+    var remainingRow = document.getElementById("statusRemainingRow");
+    if (data.HEATER && data.REMAINING_HEATING_TIME !== undefined && data.REMAINING_HEATING_TIME >= 0) {
+      // Backend calculates this dynamically using the same physics as dashboard T2R
+      var remainingHours = data.REMAINING_HEATING_TIME;
+      remainingRow.style.display = "table-row";
+      if (remainingHours === 0) {
+        document.getElementById("statusRemaining").innerHTML =
+          '<span style="color: #4caf50;">Zieltemperatur bereits erreicht</span>';
+      } else if (remainingHours >= 999) {
+        document.getElementById("statusRemaining").innerHTML =
+          '<span style="color: #ff9800;">Berechnung nicht möglich</span>';
+      } else {
+        var remainingSeconds = Math.round(remainingHours * 3600);
+        document.getElementById("statusRemaining").textContent =
+          formatDuration(remainingSeconds);
+      }
+    } else if (data.ESTIMATE >= 999) {
+      remainingRow.style.display = "none";
+    } else if (data.ESTIMATE <= 0) {
+      remainingRow.style.display = "table-row";
+      document.getElementById("statusRemaining").innerHTML =
+        '<span style="color: #4caf50;">Zieltemperatur bereits erreicht</span>';
     } else {
-      show("statusReadingState", false);
+      remainingRow.style.display = "none";
+    }
+
+    // Display heater status
+    const heaterStatus = data.HEATER
+      ? '<span style="color: #4caf50; font-weight: bold;">🔥 EIN</span>'
+      : '<span style="color: #999;">AUS</span>';
+    document.getElementById("statusHeater").innerHTML = heaterStatus;
+
+    // Display status message (heating in progress or temp reading)
+    if (data.HEATER) {
+      // Heater is on - show heating message
+      document.getElementById("statusReadingStateText").innerHTML =
+        '<span style="color: #4caf50; font-weight: bold;">🔥 Automatisches Aufheizen läuft.</span>';
+      document.getElementById("statusReadingState").style.display = "table-row";
+    } else if (data.READING_STATE > 0) {
+      // Not heating, but in temp reading mode
+      const readingStates = [
+        "",
+        "Temperaturmessung wird vorbereitet",
+        "Wassertemperatur wird übernommen",
+      ];
+      document.getElementById("statusReadingStateText").innerHTML =
+        '<span style="color: #2196f3; font-weight: bold;">⚙️ ' +
+        readingStates[data.READING_STATE] +
+        "</span>";
+      document.getElementById("statusReadingState").style.display = "table-row";
+    } else {
+      document.getElementById("statusReadingState").style.display = "none";
+    }
+
+    // Format target time
+    if (data.TARGETTIME) {
+      const targetDate = new Date(data.TARGETTIME * 1000);
+      document.getElementById("statusTargetTime").textContent =
+        formatDateTime(targetDate);
+    }
+
+    // Format start time
+    if (data.STARTTIME && data.STARTTIME > 0) {
+      const startDate = new Date(data.STARTTIME * 1000);
+      document.getElementById("statusStartTime").textContent =
+        formatDateTime(startDate);
+    } else {
+      document.getElementById("statusStartTime").textContent =
+        "Wird berechnet...";
+    }
+
+    // Format next check time (or show "completed" status)
+    if (data.CHECKCOMPLETED) {
+      document.getElementById("statusNextCheck").innerHTML =
+        '<span style="color: #4caf50; font-weight: bold;">Planung abgeschlossen</span>';
+    } else if (data.NEXTCHECK) {
+      const nextCheckDate = new Date(data.NEXTCHECK * 1000);
+      document.getElementById("statusNextCheck").textContent =
+        formatDateTime(nextCheckDate);
+    }
+
+    // Calculate and display time remaining
+    if (data.TIMEREMAINING) {
+      document.getElementById("statusTimeRemaining").textContent =
+        formatDuration(data.TIMEREMAINING);
+    }
+
+    // Calculate and display time until start
+    if (data.STARTTIME && data.STARTTIME > 0) {
+      // Only show time until start if a start time has been calculated
+      const timeUntilStart = data.TIMEUNTILSTART;
+      if (timeUntilStart <= 0 && data.HEATER) {
+        // Show "now running" only if heater is actually on
+        document.getElementById("statusTimeUntilStart").innerHTML =
+          '<span style="color: #4caf50; font-weight: bold;">Aufheizen läuft</span>';
+      } else if (timeUntilStart <= 0) {
+        // Start time reached but heater not on yet (starting soon)
+        document.getElementById("statusTimeUntilStart").innerHTML =
+          '<span style="color: #ff9800;">Heizstart wird vorbereitet...</span>';
+      } else {
+        document.getElementById("statusTimeUntilStart").textContent =
+          formatDuration(timeUntilStart);
+      }
+    } else {
+      // No start time calculated yet - still measuring
+      document.getElementById("statusTimeUntilStart").innerHTML =
+        '<span style="color: #2196f3;">Wird berechnet...</span>';
     }
   }
+}
 
-  function renderStatus(status) {
-    const active = Boolean(status && status.ACTIVE);
-    show("statusActive", active);
-    show("statusInactive", !active);
-    updateInactiveForm(status || {});
-    if (!active) return;
+/**
+ * Format Unix timestamp to readable date/time
+ */
+function formatDateTime(date) {
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const year = date.getFullYear();
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
 
-    setText("statusLabel", status.HEATER ? "Heizt" : "Aktiv");
-    setText("statusTargetTemp", numeric(status.TARGETTEMP, "--"));
-    setText("statusCurrentTemp", numeric(status.CURRENTTEMP, "--"));
+  return `${day}.${month}.${year} ${hours}:${minutes} Uhr`;
+}
 
-    const accurateTemp = numeric(status.ACCURATETEMP, 0);
-    setText("statusAccurateTemp", accurateTemp > 0 ? accurateTemp + " °C" : "Wird gemessen …");
-
-    setText("statusTargetTime", germanDateTime(status.TARGETTIME));
-    setText("statusStartTime", numeric(status.STARTTIME, 0) > 0 ? germanDateTime(status.STARTTIME) : "Wird berechnet …");
-    setText("statusTimeRemaining", countdown(status.TIMEREMAINING));
-    setText("statusTimeUntilStart", numeric(status.TIMEUNTILSTART, 0) > 0 ? countdown(status.TIMEUNTILSTART) : (status.HEATER ? "Aufheizen läuft" : "Jetzt"));
-    setText("statusNextCheck", numeric(status.NEXTCHECK, 0) > 0 ? germanDateTime(status.NEXTCHECK) : "--");
-
-    const keepOn = byId("activeKeepHeaterOn");
-    if (keepOn && document.activeElement !== keepOn) keepOn.value = status.KEEPON ? "true" : "false";
-
-    renderEstimate(status);
-    renderRemainingHeating(status);
-    renderOperatingState(status);
+/**
+ * Format duration in seconds to human readable format
+ */
+function formatDuration(seconds) {
+  if (seconds < 0) {
+    return "In der Vergangenheit";
   }
 
-  async function refreshStatus() {
-    if (requestRunning || document.hidden) return;
-    requestRunning = true;
-    try {
-      renderStatus(await postJson(API.status, {}));
-    } catch (error) {
-      console.error("Smart Schedule status could not be loaded:", error);
-    } finally {
-      requestRunning = false;
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+
+  let parts = [];
+  if (days > 0) parts.push(`${days} Tag${days > 1 ? "e" : ""}`);
+  if (hours > 0) parts.push(`${hours} Std.`);
+  if (minutes > 0 || parts.length === 0) parts.push(`${minutes} Min.`);
+
+  return parts.join(", ");
+}
+
+/**
+ * Set a new smart schedule
+ */
+function setSchedule() {
+  // Get form values
+  const dateTimeStr = document.getElementById("targetDateTime").value;
+  const targetTemp = parseInt(document.getElementById("targetTemp").value);
+  const keepHeaterOn = document.getElementById("keepHeaterOn").value === "true";
+  const poolCapacity = parseInt(document.getElementById("poolCapacity").value);
+
+  // Validate inputs
+  if (!dateTimeStr) {
+    alert("Bitte gib Datum und Uhrzeit ein.");
+    return;
+  }
+
+  if (poolCapacity < 100 || poolCapacity > 3000) { alert("Die Wassermenge muss zwischen 100 und 3000 Litern liegen."); return; }
+
+  if (targetTemp < 20 || targetTemp > 40) {
+    alert("Die Zieltemperatur muss zwischen 20°C und 40°C liegen.");
+    return;
+  }
+
+  // Convert datetime-local value to Unix timestamp
+  const targetDate = new Date(dateTimeStr);
+  const targetTime = Math.floor(targetDate.getTime() / 1000);
+
+  // Check if time is in the future
+  const now = Math.floor(Date.now() / 1000);
+  if (targetTime <= now) {
+    alert("Die Zielzeit muss in der Zukunft liegen.");
+    return;
+  }
+
+  // Prepare data
+  const data = {
+    TARGETTIME: targetTime,
+    TARGETTEMP: targetTemp,
+    KEEPON: keepHeaterOn,
+    POOLCAP: poolCapacity,
+  };
+
+  // Send to backend
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/setsmartschedule/", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4) {
+      if (xhr.status === 200) {
+        alert(
+          "✅ Zeitplan aktiviert!\n\nDas System berechnet jetzt automatisch, wann deine Heizung starten muss.",
+        );
+        updateScheduleStatus();
+      } else {
+        alert(
+          "❌ Fehler beim Aktivieren.\n\nMögliche Ursachen:\n- Uhrzeit nicht synchronisiert\n- Ungültige Parameter\n- Verbindungsfehler",
+        );
+      }
     }
-  }
+  };
 
-  function readScheduleForm() {
-    const dateValue = byId("targetDateTime").value;
-    const targetDate = new Date(dateValue);
-    const targetTemp = numeric(byId("targetTemp").value, 0);
-    const poolCapacity = numeric(byId("poolCapacity").value, 0);
+  xhr.send(JSON.stringify(data));
+}
 
-    if (!dateValue || Number.isNaN(targetDate.getTime())) throw new Error("Bitte eine gültige Wunschzeit auswählen.");
-    if (targetDate.getTime() <= Date.now() + 60000) throw new Error("Die Wunschzeit muss in der Zukunft liegen.");
-    if (targetTemp < 20 || targetTemp > 40) throw new Error("Die Zieltemperatur muss zwischen 20 und 40 °C liegen.");
-    if (poolCapacity < 100 || poolCapacity > 3000) throw new Error("Die Wassermenge muss zwischen 100 und 3000 Litern liegen.");
+/**
+ * Update heater behavior of the active smart schedule
+ */
+function updateKeepHeaterOn() {
+  const keepHeaterOn =
+    document.getElementById("activeKeepHeaterOn").value === "true";
 
-    return {
-      TARGETTIME: Math.floor(targetDate.getTime() / 1000),
-      TARGETTEMP: Math.round(targetTemp),
-      KEEPON: byId("keepHeaterOn").value === "true",
-      POOLCAP: Math.round(poolCapacity),
-    };
-  }
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/updatesmartschedule/", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
 
-  function reportError(error) {
-    const message = error && error.message ? error.message : String(error || "Unbekannter Fehler");
-    window.alert(message);
-  }
-
-  async function setSchedule() {
-    const button = byId("setScheduleBtn");
-    if (button) button.disabled = true;
-    try {
-      await postJson(API.create, readScheduleForm());
-      await refreshStatus();
-    } catch (error) {
-      reportError(error);
-    } finally {
-      if (button) button.disabled = false;
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4) {
+      if (xhr.status === 200) {
+        updateScheduleStatus();
+      } else {
+        alert("❌ Änderung konnte nicht gespeichert werden.");
+        updateScheduleStatus();
+      }
     }
+  };
+
+  xhr.send(JSON.stringify({ KEEPON: keepHeaterOn }));
+}
+
+/**
+ * Cancel active schedule
+ */
+function cancelSchedule() {
+  if (!confirm("Möchtest du den Zeitplan wirklich abbrechen?")) {
+    return;
   }
 
-  async function updateKeepHeaterOn() {
-    const select = byId("activeKeepHeaterOn");
-    if (!select) return;
-    select.disabled = true;
-    try {
-      await postJson(API.update, { KEEPON: select.value === "true" });
-      await refreshStatus();
-    } catch (error) {
-      reportError(error);
-      await refreshStatus();
-    } finally {
-      select.disabled = false;
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/cancelsmartschedule/", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4) {
+      if (xhr.status === 200) {
+        alert("✅ Zeitplan erfolgreich abgebrochen.");
+        updateScheduleStatus();
+      } else {
+        alert("❌ Fehler beim Abbrechen des Zeitplans.");
+      }
     }
+  };
+
+  xhr.send("{}");
+}
+
+// Clean up interval when page unloads
+window.addEventListener("beforeunload", function () {
+  if (scheduleUpdateInterval) {
+    clearInterval(scheduleUpdateInterval);
   }
-
-  async function cancelSchedule() {
-    const button = byId("cancelBtn");
-    if (button) button.disabled = true;
-    try {
-      await postJson(API.cancel, {});
-      await refreshStatus();
-    } catch (error) {
-      reportError(error);
-    } finally {
-      if (button) button.disabled = false;
-    }
-  }
-
-  async function loadConfigFallback() {
-    try {
-      const config = await postJson(API.config, {});
-      const capacity = numeric(config.POOLCAP, 0);
-      if (capacity >= 100 && capacity <= 3000) byId("poolCapacity").value = capacity;
-    } catch (error) {
-      console.warn("Pool capacity could not be loaded:", error);
-    }
-  }
-
-  function markEdited(event) {
-    event.currentTarget.dataset.userChanged = "1";
-  }
-
-  function start() {
-    initializeFormDefaults();
-    ["targetTemp", "poolCapacity"].forEach(function (id) {
-      const input = byId(id);
-      if (input) input.addEventListener("input", markEdited);
-    });
-
-    loadConfigFallback();
-    refreshStatus();
-    pollHandle = window.setInterval(refreshStatus, POLL_INTERVAL_MS);
-    document.addEventListener("visibilitychange", function () {
-      if (!document.hidden) refreshStatus();
-    });
-  }
-
-  window.setSchedule = setSchedule;
-  window.updateKeepHeaterOn = updateKeepHeaterOn;
-  window.cancelSchedule = cancelSchedule;
-  window.loadSmartSchedule = start;
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", start, { once: true });
-  } else {
-    start();
-  }
-
-  window.addEventListener("beforeunload", function () {
-    if (pollHandle) window.clearInterval(pollHandle);
-  });
-})();
+});

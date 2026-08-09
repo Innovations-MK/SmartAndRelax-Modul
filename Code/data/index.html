@@ -32,10 +32,12 @@
 		<div class="topnav" id="topnav">
 			<a href="./" class="active">Hauptseite</a>
 			<a href="hwconfig.html">Hardware-Konfiguration</a>
-			<a href="config.html">SPA-Konfiguration</a>
+			<a href="smartschedule.html">Smart Schedule</a>
+        <a href="config.html">SPA-Konfiguration</a>
 			<a href="webconfig.html">Web-Konfiguration</a>
 			<a href="wifi.html">Netzwerkkonfiguration</a>
-			<a href="mqtt.html">MQTT-Konfiguration</a>
+			<a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
+			<a href="updateonline.html">Online Update</a>
 			<a href="/restart/">SmartAndRelax Modul neu starten<a>
 		</div>
 
@@ -173,6 +175,23 @@
 						<input type="checkbox" id="GOD" onchange="sendCommand('toggleGodmode')">
 						<span class="slider round"></span>
 						</label>
+					</td>
+				</tr>
+			</table>
+		</section>
+
+		<section id="sectionSmartSchedule" style="display:none;">
+			<h2>Smart Schedule:</h2>
+			<table class="fixed">
+				<tr>
+					<td colspan="2" class="center">
+						<strong>Eine automatische Heizplanung ist aktiv.</strong><br>
+						<span id="mainSmartScheduleInfo">Der Pool wird automatisch für die gewählte Zielzeit vorbereitet.</span>
+					</td>
+				</tr>
+				<tr>
+					<td colspan="2" class="center">
+						<button id="mainCancelSmartScheduleBtn" class="button_red" onclick="buttonConfirm(this);cancelSmartScheduleFromMainPage()">Smart Schedule beenden</button>
 					</td>
 				</tr>
 			</table>
@@ -338,6 +357,56 @@
 // the web socket connection
 var connection;
 
+// Transport selection (WebSocket vs Polling).
+var pollTimer = null;
+function isPollingMode(){
+  return localStorage.getItem('usePolling') === 'true';
+}
+
+function startPolling(){
+  if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+  try { if(connection) connection.close(); } catch(e){}
+
+  document.body.classList.add('connected');
+  document.body.classList.remove('error');
+
+  function pollOnce(){
+    var req = new XMLHttpRequest();
+    req.open('GET', '/wsstate/?_=' + Date.now(), true);
+    req.onreadystatechange = function(){
+      if(this.readyState === 4){
+        if(this.status === 200){
+          try{
+            var arr = JSON.parse(this.responseText);
+            if(Array.isArray(arr)) arr.forEach(function(o){ handlemsg({data: JSON.stringify(o)}); });
+          }catch(e){}
+        }
+      }
+    };
+    req.send();
+  }
+
+  pollOnce();
+  pollTimer = setInterval(pollOnce, 1000);
+  console.log('Transport: POLLING');
+}
+
+function startTransport(){
+  if(isPollingMode()){
+    startPolling();
+    return;
+  }
+  connect();
+  // WS fallback: if Safari/iOS hangs or fails, switch to polling after short timeout
+  setTimeout(function(){
+    if(!document.body.classList.contains('connected')){
+      console.warn('WS connect timeout -> fallback to polling');
+      startPolling();
+    }
+  }, 2500);
+}
+
+
 // command mapping
 const cmdMap = {
   setTarget: 0,
@@ -405,15 +474,22 @@ function connect() {
   connection.onerror = function (error) {
     console.log("WebSocket Error ", error);
     document.body.classList.add("error");
-    connection.close();
+    try { connection.close(); } catch(e){}
+    // If WS fails (common on some iOS/Safari setups), fall back to polling
+    if(!isPollingMode() && !document.body.classList.contains('connected')) {
+      startPolling();
+    }
   };
 
   connection.onclose = function () {
-    console.log("WebSocket connection closed, reconnecting in 5 s");
+    console.log("WebSocket connection closed");
     document.body.classList.add("error");
-    setTimeout(function () {
-      connect();
-    }, 5000);
+    // If WS is enabled, keep old reconnect behavior. If it fails early, polling will take over.
+    if(!isPollingMode() && document.body.classList.contains('connected')){
+      setTimeout(function () {
+        connect();
+      }, 5000);
+    }
   };
 
   connection.onmessage = function (e) {
@@ -657,7 +733,17 @@ function sendCommand(cmd) {
   obj["INTERVAL"] = 0;
   obj["TXT"] = "";
   var json = JSON.stringify(obj);
-  connection.send(json);
+
+  if (isPollingMode()) {
+    var req = new XMLHttpRequest();
+    req.open('POST', '/addcommand/', true);
+    req.setRequestHeader('Content-Type', 'application/json');
+    req.send(json);
+  } else {
+    if (connection && connection.readyState === 1) {
+      connection.send(json);
+    }
+  }
   console.log(json);
 }
 
@@ -689,7 +775,89 @@ function initApplication()
         setWebConfig();
     }
     loadWebConfig();
-    connect();
+    startTransport();
+    updateSmartScheduleMainPage();
+    setInterval(updateSmartScheduleMainPage, 5000);
+}
+
+function updateSmartScheduleMainPage()
+{
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/getsmartschedule/', true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onreadystatechange = function()
+    {
+        if (xhr.readyState !== 4) return;
+
+        var section = document.getElementById('sectionSmartSchedule');
+        if (!section) return;
+
+        if (xhr.status !== 200)
+        {
+            section.style.display = 'none';
+            return;
+        }
+
+        try
+        {
+            var data = JSON.parse(xhr.responseText);
+            var active = data.ACTIVE === true || data.ACTIVE === 1 || data.ACTIVE === '1';
+            section.style.display = active ? 'block' : 'none';
+
+            if (active)
+            {
+                var info = document.getElementById('mainSmartScheduleInfo');
+                if (info)
+                {
+                    var text = 'Der Pool wird automatisch für die gewählte Zielzeit vorbereitet.';
+                    if (data.TARGETTEMP)
+                    {
+                        text = 'Zieltemperatur: ' + data.TARGETTEMP + ' °C';
+                    }
+                    info.textContent = text;
+                }
+            }
+        }
+        catch (e)
+        {
+            section.style.display = 'none';
+        }
+    };
+    xhr.send('{}');
+}
+
+function cancelSmartScheduleFromMainPage()
+{
+    if (!confirm('Möchtest du den aktiven Smart Schedule wirklich beenden?'))
+    {
+        return;
+    }
+
+    var button = document.getElementById('mainCancelSmartScheduleBtn');
+    if (button) button.disabled = true;
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/cancelsmartschedule/', true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onreadystatechange = function()
+    {
+        if (xhr.readyState !== 4) return;
+
+        if (button) button.disabled = false;
+
+        if (xhr.status === 200)
+        {
+            var section = document.getElementById('sectionSmartSchedule');
+            if (section) section.style.display = 'none';
+            alert('Smart Schedule wurde beendet.');
+            updateSmartScheduleMainPage();
+        }
+        else
+        {
+            alert('Smart Schedule konnte nicht beendet werden.');
+        }
+    };
+    xhr.send('{}');
 }
 
 function setWebConfig()
