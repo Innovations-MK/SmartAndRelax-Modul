@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>SmartAndRelax | CLOUD/MQTT-Konfiguration</title>
+	<meta charset="utf-8">
+	<link rel="icon" type="image/png" sizes="180x180" href="favicon.png">
+	<meta name="theme-color" content="#0f4677">
+	<!-- <link rel="manifest" href="manifest.json"> -->
+	<link rel="stylesheet" href="main.css">
+	<meta  name="viewport" content="width=device-width, initial-scale=1 maximum-scale=1">
+	<!-- <script src="function.js" type="text/javascript"></script> -->
+</head>
+
+<body>
+	<div id="site">
+		<header>
+			<form id="darkModeForm">
+                <label class="switch">
+                    <input type="checkbox" id="darkModeToggle" onchange="toggleDarkMode()">
+                    <span class="slider round"></span>
+                </label>
+            </form>
+			<a href="./"><div id="header"><span>CLOUD/MQTT-Konfiguration</span><span>smartandrelax</span></div></a>
+			<a href="javascript:void(0);" class="topnavicon" onclick="topNav()"></a>
+		</header>
+
+		<div class="topnav" id="topnav">
+			<a href="./">Hauptseite</a>
+			<a href="hwconfig.html">Hardware-Konfiguration</a>
+			<a href="config.html">SPA-Konfiguration</a>
+			<a href="webconfig.html">Web-Konfiguration</a>
+			<a href="wifi.html">Netzwerkkonfiguration</a>
+			<a href="mqtt.html" class="active">CLOUD/MQTT-Konfiguration</a>
+			<a href="/restart/">SmartAndRelax Modul neu starten<a>
+		</div>
+
+		<section>
+			<table>
+				<tr>
+					<td><label for="enableMqtt" id="enableMqttLabel">MQTT aktivieren:</label></td>
+					<td><input type="checkbox" id="enableMqtt"></td>
+				</tr>
+
+<div class="row">
+  <div class="col-25"><label>Cloud/MQTT Mode</label></div>
+  <div class="col-75">
+    <select id="mqttMode" onchange="applyMqttModeUi()">
+      <option value="cloud">Cloud (SmartAndRelax)</option>
+      <option value="custom">Custom / Local (HomeAssistant)</option>
+    </select>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col-25"><label>Device MAC</label></div>
+  <div class="col-75"><input id="deviceMac" type="text" readonly></div>
+</div>
+
+<div class="row">
+  <div class="col-25"><label>Device ID</label></div>
+  <div class="col-75"><input id="deviceId" type="text" readonly></div>
+</div>
+
+<div class="row" id="pairingRow">
+  <div class="col-25"><label>Pairing Code</label></div>
+  <div class="col-75"><input id="mqttPairingCode" type="text" maxlength="12" placeholder="z.B. 6-stellig"></div>
+</div>
+
+<div id="cloudHint" style="display:none; margin:10px 0; padding:10px; border-radius:8px; background:#f3f3f3;">
+<b>Hinweis (Cloud Mode):</b><br>
+Für die Cloud reicht der <b>Pairing Code</b>.<br>
+Der Pairing Code muss zwischen 6 bis 8 Zahlen lang sein. Der Pairing-Code ist für 60 Minuten gültig – innerhalb dieser Zeit muss das Modul mit der Webapp gepairt werden.<br>
+Die Webapp erreichst du hier: <a href="https://webapp.mk-innovations.de" target="_blank">webapp.mk-innovations.de</a>
+</div>
+
+
+
+
+				<tbody id="customMqttFields">
+					<tr>
+						<td>IP-Adresse des MQTT Servers:</td>
+						<td>
+							<input type="text" id="mqttIpAddress1" maxlength="3" style="width:30px">
+							. <input type="text" id="mqttIpAddress2" maxlength="3" style="width:30px">
+							. <input type="text" id="mqttIpAddress3" maxlength="3" style="width:30px">
+							. <input type="text" id="mqttIpAddress4" maxlength="3" style="width:30px">
+						</td>
+					</tr>
+					<tr>
+						<td>Port:</td>
+						<td><input type="text" id="mqttPort"></td>
+					</tr>
+					<tr>
+						<td>Benutzername:</td>
+						<td><input type="text" id="mqttUsername"></td>
+					</tr>
+					<tr>
+						<td>Passwort:</td>
+						<td>
+						<input type="password" id="mqttPassword" placeholder="<enter password>">
+						</td>
+						<!--<td><input type="password" id="mqttPassword"><input type="checkbox" onclick="togglePlainText('mqttPassword')"></td>-->
+					</tr>
+					<tr>
+						<td>Client ID:</td>
+						<td><input type="text" id="mqttClientId"></td>
+					</tr>
+					<tr>
+						<td>Basis-Topic:</td>
+						<td><input type="text" id="mqttBaseTopic"></td>
+					</tr>
+					<tr>
+						<td>Telemetry-Intervall (s):</td>
+						<td><input type="text" id="mqttTelemetryInterval"></td>
+					</tr>
+				</tbody>
+			</table>
+		</section>
+
+		<footer class="center">
+			<button id="save" class="button" onclick="saveMqttConfig()">Speichern</button>
+		</footer>
+	</div>
+
+<script>
+    function topNav() {
+      var x = document.getElementById("topnav");
+      if (x.className === "topnav") {
+        x.className += " responsive";
+      } else {
+        x.className = "topnav";
+      }
+    }
+
+    function togglePlainText(id) {
+      var x = document.getElementById(id);
+      if (x.type === "password") {
+        x.type = "text";
+      } else {
+        x.type = "password";
+      }
+    }
+
+function validatePassword(id) {
+  var mode = document.getElementById("mqttMode").value;
+
+  // Cloud Mode → Passwort wird intern gesetzt → OK
+  if (mode === "cloud") return true;
+
+  // Custom Mode → Passwort Pflicht
+  var x = document.getElementById(id);
+  if (!x.value || x.value.length < 1) {
+    alert("Bitte ein MQTT-Passwort eingeben (Custom Mode).");
+    return false;
+  }
+  return true;
+}
+
+    // Function to update the displayed number
+    function updateNumber(opt, parent) {
+      var parentElement = parent.parentElement;
+      var numDisplay = parentElement.querySelector(".numDisplay");
+      var number = parseInt(numDisplay.textContent);
+      if (opt == "up") number += 1;
+      if (opt == "dn") number -= 1;
+      numDisplay.textContent = number;
+    }
+
+    function increaseNumber(id) {
+      var x = document.getElementById(id);
+      var val = Number(x.value);
+      var max = x.max;
+      if (max > val) {
+        val += 1;
+        x.value = val;
+      }
+      var opt = "up";
+      updateNumber(opt, x);
+    }
+
+    function decreaseNumber(id) {
+      var x = document.getElementById(id);
+      var val = Number(x.value);
+      var min = x.min;
+      if (min < val) {
+        val -= 1;
+        x.value = val;
+      }
+      var opt = "dn";
+      updateNumber(opt, x);
+    }
+
+    function buttonConfirm(elem, text = "", timeout = 3, reset = true) {
+      var originalText = elem.innerHTML;
+
+      elem.innerHTML = text == "" ? "&check;" : text;
+      elem.disabled = true;
+
+      if (reset) {
+        setTimeout(function () {
+          elem.innerHTML = originalText;
+          elem.disabled = false;
+        }, timeout * 1000);
+      }
+    }
+
+</script>
+<script>
+loadMqttConfig();
+
+function loadMqttConfig()
+{
+	var req = new XMLHttpRequest();
+	req.open('POST', '/getmqtt/');
+	req.send();
+	req.onreadystatechange = function()
+	{
+		if (this.readyState == 4 && this.status == 200)
+		{
+			var json = JSON.parse(req.responseText);
+
+document.getElementById("mqttMode").value = json.mqttMode || "custom";
+document.getElementById("deviceMac").value = json.deviceMac || "";
+document.getElementById("deviceId").value = json.deviceId || "";
+document.getElementById("mqttPairingCode").value = json.mqttPairingCode || "";
+
+
+			console.log(json);
+			document.getElementById('enableMqtt').checked = json.enableMqtt;
+			document.getElementById('mqttIpAddress1').value = json.mqttIpAddress[0];
+			document.getElementById('mqttIpAddress2').value = json.mqttIpAddress[1];
+			document.getElementById('mqttIpAddress3').value = json.mqttIpAddress[2];
+			document.getElementById('mqttIpAddress4').value = json.mqttIpAddress[3];
+			document.getElementById('mqttPort').value = json.mqttPort;
+			document.getElementById('mqttUsername').value = json.mqttUsername;
+				// Password is never returned by the firmware. Keep the field empty.
+				document.getElementById('mqttPassword').value = "";
+			document.getElementById('mqttClientId').value = json.mqttClientId;
+			document.getElementById('mqttBaseTopic').value = json.mqttBaseTopic;
+			document.getElementById('mqttTelemetryInterval').value = json.mqttTelemetryInterval;
+
+			
+			applyMqttModeUi();
+
+		}
+	}
+}
+
+
+
+function applyMqttModeUi(){
+  var mode = document.getElementById("mqttMode").value;
+  var cloud = (mode === "cloud");
+
+  // Label: im Cloud-Bereich verständlicher
+  var lbl = document.getElementById("enableMqttLabel");
+  if (lbl) lbl.textContent = cloud ? "Cloudmodus aktivieren:" : "MQTT aktivieren:";
+
+  // Cloud: Custom Felder komplett ausblenden (damit keine Cloud-/Custom-Werte sichtbar sind)
+  var customFields = document.getElementById("customMqttFields");
+  if (customFields) customFields.style.display = cloud ? "none" : "";
+
+  // Pairing Code: nur in Cloud relevant
+  var pairingRow = document.getElementById("pairingRow");
+  if (pairingRow) pairingRow.style.display = cloud ? "" : "none";
+
+  // Diese Felder sind im Cloud-Mode nur Anzeige (werden ignoriert)
+  var ids = [
+    "mqttIpAddress1","mqttIpAddress2","mqttIpAddress3","mqttIpAddress4",
+    "mqttPort","mqttUsername","mqttPassword","mqttClientId","mqttBaseTopic"
+  ];
+
+  ids.forEach(function(id){
+    var el = document.getElementById(id);
+    if(!el) return;
+  if (cloud) {
+  el.readOnly = true;
+  el.classList.add("readonly");
+} else {
+  el.readOnly = false;
+  el.classList.remove("readonly");
+}
+
+  });
+
+  // Pairing Code
+  var pc = document.getElementById("mqttPairingCode");
+  if(pc) pc.placeholder = "z.B. 6-stellig";
+
+  // UX Hinweistext
+  var hint = document.getElementById("cloudHint");
+  if (hint) hint.style.display = cloud ? "block" : "none";
+
+var pw = document.getElementById("mqttPassword");
+if (pw) {
+  if (cloud) {
+    pw.value = "";
+    pw.readOnly = true;
+    pw.placeholder = "(Cloud: automatisch gesetzt)";
+  } else {
+    pw.readOnly = false;
+    // Custom Defaults / Platzhalter (nur beim Umschalten, wenn Feld noch leer)
+    pw.value = "";
+    pw.placeholder = "<enter password>";
+  }
+}
+
+  // Custom Defaultwerte (nur falls leer)
+  if (!cloud) {
+    var setIfEmpty = function(id, val){
+      var el = document.getElementById(id);
+      if (!el) return;
+      if (String(el.value||"").trim() === "") el.value = val;
+    };
+
+    // IP
+    setIfEmpty("mqttIpAddress1", "192");
+    setIfEmpty("mqttIpAddress2", "168");
+    setIfEmpty("mqttIpAddress3", "0");
+    setIfEmpty("mqttIpAddress4", "20");
+
+    // Port
+    setIfEmpty("mqttPort", "1883");
+
+    // Username placeholder
+    var u = document.getElementById("mqttUsername");
+    if (u) u.placeholder = "Benutzername";
+
+    // Client-ID / Topic
+    setIfEmpty("mqttClientId", "Lay-Z-Spa Module");
+    setIfEmpty("mqttBaseTopic", "Lay-Z-Spa Module");
+
+    // Telemetrie
+    setIfEmpty("mqttTelemetryInterval", "600");
+  }
+
+
+
+}
+
+
+
+
+
+function saveMqttConfig()
+{
+  var mode = document.getElementById("mqttMode").value;
+  var cloud = (mode === "cloud");
+
+  // Passwort nur im Custom/Local Mode prüfen – und nur, wenn MQTT wirklich aktiviert werden soll.
+  // Dadurch kann Cloudmodus ohne Passworteingabe deaktiviert werden (Checkbox aus + Speichern),
+  // und auch im Custom Mode kann man MQTT deaktivieren, ohne ein Passwort eingeben zu müssen.
+  if (!cloud && document.getElementById('enableMqtt').checked) {
+    if (!validatePassword('mqttPassword')) return;
+  }
+
+  buttonConfirm(document.getElementById('save'));
+
+  var json = {
+    'enableMqtt': (document.getElementById('enableMqtt').checked),
+    'mqttMode': mode,
+    'mqttPairingCode': (document.getElementById('mqttPairingCode').value),
+    'mqttTelemetryInterval': parseInt(document.getElementById('mqttTelemetryInterval').value)
+  };
+
+  // Custom: Userwerte mitsenden
+  if (!cloud) {
+    json.mqttIpAddress = [
+      parseInt(document.getElementById('mqttIpAddress1').value),
+      parseInt(document.getElementById('mqttIpAddress2').value),
+      parseInt(document.getElementById('mqttIpAddress3').value),
+      parseInt(document.getElementById('mqttIpAddress4').value)
+    ];
+    json.mqttPort     = parseInt(document.getElementById('mqttPort').value);
+    json.mqttUsername = document.getElementById('mqttUsername').value;
+    json.mqttPassword = document.getElementById('mqttPassword').value;
+    json.mqttClientId = document.getElementById('mqttClientId').value;
+    json.mqttBaseTopic= document.getElementById('mqttBaseTopic').value;
+  } else {
+    // Cloud: optional nur fürs UI speichern (oder komplett weglassen)
+    // Ich lasse es bewusst weg, damit es nicht verwirrt.
+    // Falls du es trotzdem speichern willst: setze hier placeholder Werte.
+  }
+
+  var req = new XMLHttpRequest();
+  req.open('POST', '/setmqtt/');
+  req.send(JSON.stringify(json));
+
+  // UX: Passwortfeld zurücksetzen (nur Custom)
+  if (!cloud) {
+    var pw = document.getElementById('mqttPassword');
+    if (pw) pw.value = "";
+  }
+
+  console.log(json);
+}
+</script>	
+<script src="darkmode.js" type="text/javascript"></script>
+
+</body>
+</html>

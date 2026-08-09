@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <title>SmartAndRelax | Smart Schedule</title>
+    <meta charset="utf-8" />
+    <link rel="icon" type="image/png" sizes="180x180" href="logo.png" />
+    <meta name="theme-color" content="#147419" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="stylesheet" href="main.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+
+    <style>
+      .smart-page {
+        --smart-green: var(--accent-color);
+        --smart-blue: #1976d2;
+        --smart-orange: #ef8b18;
+        --smart-red: #c62828;
+        --smart-card: rgba(255, 255, 255, 0.58);
+        --smart-border: rgba(0, 0, 0, 0.10);
+      }
+
+      .darkmode .smart-page {
+        --smart-card: rgba(255, 255, 255, 0.055);
+        --smart-border: rgba(255, 255, 255, 0.10);
+      }
+
+      .smart-page section {
+        padding: 16px 14px;
+      }
+
+      .smart-page h2 {
+        margin: 0 0 12px;
+        font-size: 1.02em;
+        text-transform: none;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+
+      .smart-intro {
+        margin: 0 0 14px;
+        line-height: 1.42;
+      }
+
+      .smart-card {
+        background: var(--smart-card);
+        border: 1px solid var(--smart-border);
+        border-radius: 12px;
+        padding: 13px;
+        box-sizing: border-box;
+      }
+
+      .smart-empty {
+        text-align: center;
+        padding: 18px 12px;
+      }
+
+      .smart-empty-icon {
+        display: block;
+        font-size: 1.75em;
+        margin-bottom: 7px;
+      }
+
+      .smart-empty strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .smart-status-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+
+      .smart-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 9px;
+        border-radius: 999px;
+        background: rgba(20, 116, 25, 0.14);
+        color: var(--smart-green);
+        font-weight: 700;
+        font-size: 0.82em;
+      }
+
+      .smart-badge::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      .smart-status-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+
+      .smart-metric {
+        background: rgba(0, 0, 0, 0.035);
+        border-radius: 9px;
+        padding: 9px 10px;
+        min-width: 0;
+      }
+
+      .darkmode .smart-metric {
+        background: rgba(0, 0, 0, 0.16);
+      }
+
+      .smart-metric-label {
+        display: block;
+        font-size: 0.75em;
+        opacity: 0.72;
+        margin-bottom: 3px;
+      }
+
+      .smart-metric-value {
+        display: block;
+        font-weight: 650;
+        line-height: 1.25;
+        word-break: break-word;
+      }
+
+      .smart-details {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 3px;
+      }
+
+      .smart-details td {
+        padding: 6px 2px;
+        vertical-align: top;
+        border-bottom: 1px solid var(--smart-border);
+      }
+
+      .smart-details tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .smart-details td:first-child {
+        width: 48%;
+        opacity: 0.82;
+      }
+
+      .smart-details td:last-child {
+        font-weight: 550;
+      }
+
+      .smart-message-row td {
+        padding: 9px 8px;
+        background: rgba(25, 118, 210, 0.09);
+        border-radius: 7px;
+        text-align: center;
+      }
+
+      .smart-form {
+        display: grid;
+        gap: 11px;
+      }
+
+      .smart-field label {
+        display: block;
+        font-size: 0.84em;
+        font-weight: 600;
+        margin-bottom: 5px;
+      }
+
+      .smart-control-wrap {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .smart-control-wrap input,
+      .smart-control-wrap select {
+        width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+        padding: 8px 9px;
+        border-radius: 7px;
+        border: 1px solid rgba(0, 0, 0, 0.22);
+        background: rgba(255, 255, 255, 0.82);
+        color: inherit;
+      }
+
+      .darkmode .smart-control-wrap input,
+      .darkmode .smart-control-wrap select {
+        border-color: rgba(255, 255, 255, 0.22);
+        background: rgba(0, 0, 0, 0.23);
+      }
+
+      .smart-unit {
+        white-space: nowrap;
+        font-size: 0.88em;
+        opacity: 0.78;
+      }
+
+      .smart-action {
+        text-align: center;
+        padding-top: 3px;
+      }
+
+      .smart-page .button,
+      .smart-page .button_red {
+        min-width: 190px;
+        font-weight: 700;
+      }
+
+      .smart-help-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .smart-help-item {
+        display: grid;
+        grid-template-columns: 34px 1fr;
+        gap: 10px;
+        align-items: start;
+        padding: 11px;
+        background: var(--smart-card);
+        border: 1px solid var(--smart-border);
+        border-radius: 11px;
+      }
+
+      .smart-help-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(20, 116, 25, 0.13);
+        font-size: 1.08em;
+      }
+
+      .smart-help-item strong {
+        display: block;
+        margin-bottom: 3px;
+      }
+
+      .smart-help-item p {
+        padding: 0;
+        line-height: 1.38;
+        font-size: 0.92em;
+      }
+
+      .smart-note {
+        margin-top: 11px;
+        padding: 10px 11px;
+        border-left: 4px solid var(--smart-orange);
+        background: rgba(239, 139, 24, 0.10);
+        border-radius: 0 9px 9px 0;
+        line-height: 1.38;
+        font-size: 0.9em;
+      }
+
+      @media (max-width: 360px) {
+        .smart-status-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .smart-details td:first-child {
+          width: 45%;
+        }
+      }
+    </style>
+
+    <script src="function.js" type="text/javascript"></script>
+    <script src="index.js" type="text/javascript"></script>
+    <script src="smartschedule.js" type="text/javascript"></script>
+  </head>
+
+  <body class="smart-page" onload="loadSmartSchedule()">
+    <div id="site">
+      <header>
+        <form id="darkModeForm">
+          <label class="switch">
+            <input type="checkbox" id="darkModeToggle" onchange="toggleDarkMode()" />
+            <span class="slider round"></span>
+          </label>
+        </form>
+        <a href="./">
+          <div id="header">
+            <span>Smart Schedule</span><span id="fw">SmartAndRelax</span>
+          </div>
+        </a>
+        <a href="javascript:void(0);" class="topnavicon" onclick="topNav()"></a>
+      </header>
+
+      <div class="topnav" id="topnav">
+        <a href="./">Hauptseite</a>
+        <a href="hwconfig.html">Hardware-Konfiguration</a>
+        <a href="smartschedule.html" class="active">Smart Schedule</a>
+        <a href="config.html">SPA-Konfiguration</a>
+        <a href="webconfig.html">Web-Konfiguration</a>
+        <a href="wifi.html">Netzwerkkonfiguration</a>
+        <a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
+        <a href="updateonline.html">Online Update</a>
+        <a href="/restart/">SmartAndRelax Modul neu starten</a>
+      </div>
+
+      <section>
+        <h2>Deine Heizplanung</h2>
+
+        <div id="statusActive" class="smart-card" style="display: none">
+          <div class="smart-status-head">
+            <strong>Geplanter Aufheizvorgang</strong>
+            <span class="smart-badge"><span id="statusLabel">Aktiv</span></span>
+          </div>
+
+          <div class="smart-status-grid">
+            <div class="smart-metric">
+              <span class="smart-metric-label">Wunschtemperatur</span>
+              <span class="smart-metric-value"><span id="statusTargetTemp">--</span> °C</span>
+            </div>
+            <div class="smart-metric">
+              <span class="smart-metric-label">Fertig zur Wunschzeit</span>
+              <span class="smart-metric-value" id="statusTargetTime">--</span>
+            </div>
+            <div class="smart-metric">
+              <span class="smart-metric-label">Zeit bis zum Ziel</span>
+              <span class="smart-metric-value" id="statusTimeRemaining">--</span>
+            </div>
+            <div class="smart-metric">
+              <span class="smart-metric-label">Heizbeginn</span>
+              <span class="smart-metric-value" id="statusStartTime">--</span>
+            </div>
+          </div>
+
+          <table class="smart-details">
+            <tr>
+              <td>Countdown bis Heizbeginn</td>
+              <td><span id="statusTimeUntilStart">--</span></td>
+            </tr>
+            <tr>
+              <td>Berechnete Aufheizzeit</td>
+              <td><span id="statusEstimate">--</span></td>
+            </tr>
+            <tr>
+              <td>Eingeplante Zeitreserve</td>
+              <td><span id="statusBuffer">--</span></td>
+            </tr>
+            <tr>
+              <td>Voraussichtlicher Energiebedarf</td>
+              <td><span id="statusCost">--</span></td>
+            </tr>
+            <tr id="statusRemainingRow" style="display: none">
+              <td><strong>Noch benötigte Heizzeit</strong></td>
+              <td><strong><span id="statusRemaining">--</span></strong></td>
+            </tr>
+            <tr>
+              <td><strong>Heizung</strong></td>
+              <td><strong><span id="statusHeater">--</span></strong></td>
+            </tr>
+            <tr>
+              <td><label for="activeKeepHeaterOn">Nach Erreichen des Ziels</label></td>
+              <td>
+                <select id="activeKeepHeaterOn" onchange="updateKeepHeaterOn()">
+                  <option value="false">Heizung ausschalten</option>
+                  <option value="true">Heizung eingeschaltet lassen</option>
+                </select>
+              </td>
+            </tr>
+            <tr id="statusReadingState" class="smart-message-row" style="display: none">
+              <td colspan="2"><span id="statusReadingStateText">--</span></td>
+            </tr>
+            <tr>
+              <td>Momentane Wassertemperatur</td>
+              <td><span id="statusCurrentTemp">--</span> °C</td>
+            </tr>
+            <tr>
+              <td>Für die Planung verwendeter Messwert</td>
+              <td><span id="statusAccurateTemp">--</span></td>
+            </tr>
+            <tr>
+              <td>Nächste Neuberechnung</td>
+              <td><span id="statusNextCheck">--</span></td>
+            </tr>
+          </table>
+
+          <div class="smart-action">
+            <button id="cancelBtn" class="button_red" onclick="buttonConfirm(this); cancelSchedule();">
+              Heizplanung beenden
+            </button>
+          </div>
+        </div>
+
+        <div id="statusInactive" class="smart-card smart-empty">
+          <span class="smart-empty-icon">🗓️</span>
+          <strong>Aktuell ist keine Heizplanung aktiv</strong>
+          Lege fest, wann dein Whirlpool die gewünschte Temperatur erreicht haben soll.
+        </div>
+      </section>
+
+      <section>
+        <h2>Neue Wunschzeit planen</h2>
+        <p class="smart-intro">
+          Du bestimmst nur Zeitpunkt und Zieltemperatur. SmartAndRelax ermittelt daraus den passenden Heizbeginn und passt die Planung bei Bedarf automatisch an.
+        </p>
+
+        <div class="smart-card smart-form">
+          <div class="smart-field">
+            <label for="targetDateTime">Wann soll das Wasser fertig aufgeheizt sein?</label>
+            <div class="smart-control-wrap">
+              <input type="datetime-local" id="targetDateTime" required />
+            </div>
+          </div>
+
+          <div class="smart-field">
+            <label for="targetTemp">Gewünschte Wassertemperatur</label>
+            <div class="smart-control-wrap">
+              <input type="number" id="targetTemp" value="37" min="20" max="40" required />
+              <span class="smart-unit">°C</span>
+            </div>
+          </div>
+
+          <div class="smart-field">
+            <label for="poolCapacity">Wassermenge des Whirlpools</label>
+            <div class="smart-control-wrap">
+              <input type="number" id="poolCapacity" value="700" min="100" max="3000" step="10" required />
+              <span class="smart-unit">Liter</span>
+            </div>
+          </div>
+
+          <div class="smart-field">
+            <label for="keepHeaterOn">Was soll nach Erreichen der Zieltemperatur passieren?</label>
+            <div class="smart-control-wrap">
+              <select id="keepHeaterOn">
+                <option value="false">Heizung ausschalten</option>
+                <option value="true">Heizung eingeschaltet lassen</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="smart-action">
+            <button id="setScheduleBtn" class="button" onclick="buttonConfirm(this); setSchedule();">
+              Heizplanung starten
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>So plant SmartAndRelax den Heizbeginn</h2>
+
+        <div class="smart-help-list">
+          <div class="smart-help-item">
+            <div class="smart-help-icon">🎯</div>
+            <div>
+              <strong>Automatische Berechnung des Heizbeginns</strong>
+              <p>Du legst Zielzeit, Wunschtemperatur und Wassermenge fest. SmartAndRelax berechnet daraus anhand der aktuellen Wasser- und Umgebungstemperatur, wann die Heizung automatisch starten muss.</p>
+            </div>
+          </div>
+
+          <div class="smart-help-item">
+            <div class="smart-help-icon">🌡️</div>
+            <div>
+              <strong>Genaue Temperaturmessung</strong>
+              <p>Ist die Filterpumpe ausgeschaltet, wird sie für die Messung automatisch eingeschaltet. Nach 20 Sekunden Pumpenlauf wartet das System weitere 20 Sekunden, bevor die Wassertemperatur für die Berechnung übernommen wird.</p>
+            </div>
+          </div>
+
+          <div class="smart-help-item">
+            <div class="smart-help-icon">🧠</div>
+            <div>
+              <strong>Adaptive Neuberechnung</strong>
+              <p>Liegt der berechnete Heizbeginn noch mehr als 24 Stunden entfernt, wird die Planung alle 12 Stunden überprüft. Danach erfolgt die nächste Prüfung jeweils nach der Hälfte der verbleibenden Zeit bis zum Heizstart.</p>
+            </div>
+          </div>
+
+          <div class="smart-help-item">
+            <div class="smart-help-icon">⏱️</div>
+            <div>
+              <strong>Zusätzlicher Sicherheitspuffer</strong>
+              <p>Zur berechneten Aufheizdauer werden 10&nbsp;% Zeitreserve addiert, mindestens jedoch 1 Stunde. Dadurch werden normale Wärmeverluste und kleinere Abweichungen der tatsächlichen Heizleistung berücksichtigt.</p>
+            </div>
+          </div>
+
+          <div class="smart-help-item">
+            <div class="smart-help-icon">💾</div>
+            <div>
+              <strong>Speicherung bei einem Neustart</strong>
+              <p>Der aktive Zeitplan wird dauerhaft im Modul gespeichert. Nach einem Neustart wird er automatisch wieder geladen und bis zur festgelegten Zielzeit fortgeführt.</p>
+            </div>
+          </div>
+
+          <div class="smart-help-item">
+            <div class="smart-help-icon">✋</div>
+            <div>
+              <strong>Manuelle Bedienung hat Vorrang</strong>
+              <p>Schaltest du die Heizung oder Filterpumpe während des automatischen Aufheizens am Bedienpanel oder auf der Hauptseite manuell aus, wird Smart Schedule sofort beendet. Der Zeitplan kann außerdem jederzeit über „Heizplanung beenden“ abgebrochen werden.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="smart-note">
+          <strong>Hinweis:</strong> Die berechneten Werte sind eine praxisnahe Schätzung. Abdeckung, Wind, Aufstellort und tatsächliche Heizleistung können die reale Aufheizzeit beeinflussen.
+        </div>
+      </section>
+    </div>
+
+    <script src="darkmode.js"></script>
+  </body>
+</html>
