@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SmartAndRelax | Online Update</title>
+    <meta charset="utf-8">
+    <link rel="icon" type="image/png" sizes="180x180" href="favicon.png">
+    <meta name="theme-color" content="#0f4677">
+    <link rel="stylesheet" href="main.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1 maximum-scale=1">
+    <style>
+        .otaBox{background:#eee;border-radius:8px;padding:12px;margin-top:12px;line-height:1.4}
+        .otaOk{color:green;font-weight:bold}.otaErr{color:#b00020;font-weight:bold}.otaInfo{color:#333;font-weight:bold}
+        .bar{height:16px;background:#ccc;border-radius:8px;overflow:hidden;margin-top:8px}.bar>div{height:16px;background:#0b7d18;width:0%}
+    </style>
+</head>
+<body>
+<div id="site">
+    <header>
+        <form id="darkModeForm">
+            <label class="switch">
+                <input type="checkbox" id="darkModeToggle" onchange="toggleDarkMode()">
+                <span class="slider round"></span>
+            </label>
+        </form>
+        <a href="./"><div id="header"><span>Online Update</span><span>smartandrelax</span></div></a>
+        <a href="javascript:void(0);" class="topnavicon" onclick="topNav()"></a>
+    </header>
+
+    <div class="topnav" id="topnav">
+        <a href="./">Hauptseite</a>
+        <a href="hwconfig.html">Hardware-Konfiguration</a>
+        <a href="config.html">SPA-Konfiguration</a>
+        <a href="webconfig.html">Web-Konfiguration</a>
+        <a href="wifi.html">Netzwerkkonfiguration</a>
+        <a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
+        <a href="updateonline.html" class="active">Online Update</a>
+        <a href="/restart/">SmartAndRelax Modul neu starten</a>
+    </div>
+
+    <section>
+        <h2>Online Update</h2>
+        <p>Hier kann das SmartAndRelax WLAN-Modul direkt über das Internet aktualisiert werden.</p>
+        <p><strong>Wichtig:</strong> Während des Updates das Modul und die Pumpe nicht vom Strom trennen.</p>
+    </section>
+
+    <section>
+        <h2>Versionsprüfung</h2>
+        <table>
+            <tr><td>Installiert:</td><td id="current">wird geladen...</td></tr>
+            <tr><td>Online verfügbar:</td><td id="latest">wird geladen...</td></tr>
+            <tr><td>Status:</td><td id="status">prüfe...</td></tr>
+        </table>
+        <p id="notes"></p>
+        <p class="center"><button class="button" onclick="checkUpdate()">Erneut prüfen</button></p>
+    </section>
+
+    <section>
+        <h2>Installationsstatus</h2>
+        <table>
+            <tr><td>LittleFS / Weboberfläche:</td><td id="fsinstalled">wird geprüft...</td></tr>
+            <tr><td>Firmware:</td><td id="fwinstalled">wird geprüft...</td></tr>
+        </table>
+        <p class="smaller">Nach einem erfolgreichen Update wird dieser Status automatisch aktualisiert.</p>
+    </section>
+
+    <section>
+        <h2>Update durchführen</h2>
+        <p><strong>Empfohlene Reihenfolge:</strong></p>
+        <p>1. zuerst Weboberfläche / LittleFS aktualisieren</p>
+        <p>2. nach dem Neustart diese Seite erneut öffnen</p>
+        <p>3. danach Firmware aktualisieren</p>
+        <p class="center"><button id="btnfs" class="button" onclick="startUpdate('littlefs')" disabled>LittleFS / Weboberfläche updaten</button></p>
+        <p class="center"><button id="btnfw" class="button" onclick="startUpdate('firmware')" disabled>Firmware updaten</button></p>
+        <p><label><input type="checkbox" id="force"> Update erzwingen</label></p>
+        <div id="result" class="otaBox" style="display:none"></div>
+        <div class="bar" id="barwrap" style="display:none"><div id="bar"></div></div>
+    </section>
+
+    <section>
+        <h2>Hinweis</h2>
+        <p>Nach erfolgreichem Update startet das Modul automatisch neu. Die Verbindung zur Seite kann dabei abbrechen.</p>
+        <p>Die Update-Dateien werden von <strong>GitHub / jsDelivr</strong> geladen.</p>
+    </section>
+
+    <footer><p class="center">SmartAndRelax Online Update</p></footer>
+</div>
+
+<script src="darkmode.js"></script>
+<script>
+let polling = null;
+function topNav(){var x=document.getElementById("topnav"); if(x.className==="topnav")x.className+=" responsive"; else x.className="topnav";}
+function setText(id,value){document.getElementById(id).innerText=value||"-";}
+function showResult(html, cls){let r=document.getElementById('result'); r.style.display='block'; r.className='otaBox '+(cls||''); r.innerHTML=html;}
+function setButtons(en){document.getElementById('btnfs').disabled=!en; document.getElementById('btnfw').disabled=!en;}
+function setProgress(p){document.getElementById('barwrap').style.display='block'; document.getElementById('bar').style.width=Math.max(0,Math.min(100,p||0))+'%';}
+function fmtBytes(n){n=Number(n||0); if(!n)return ''; if(n>900000)return ' ('+Math.round(n/1024)+' KB)'; return ' ('+n+' Bytes)';}
+function updateInstallStatus(j){
+    if(!j)return;
+    let fs=j.littlefsInstalled?'<span class="otaOk">installiert</span>'+fmtBytes(j.littlefsInstalledSize):'<span class="otaInfo">noch nicht bestätigt</span>';
+    let fw=j.firmwareInstalled?'<span class="otaOk">installiert</span>'+fmtBytes(j.firmwareInstalledSize):'<span class="otaInfo">noch nicht bestätigt</span>';
+    document.getElementById('fsinstalled').innerHTML=fs;
+    document.getElementById('fwinstalled').innerHTML=fw;
+}
+
+async function checkUpdate(){
+    setText('status','prüfe...'); setButtons(false);
+    try{
+        const r=await fetch('/api/update/check?ts='+Date.now()); const j=await r.json();
+        updateInstallStatus(j);
+        setText('current',j.current); setText('latest',j.latest); setText('notes',j.notes);
+        if(!j.ok){setText('status','Fehler: '+(j.error||'Versionsprüfung fehlgeschlagen')); return;}
+        setText('status',j.updateAvailable?'Neue Version verfügbar':'Keine neuere Version gefunden');
+        setButtons(true);
+    }catch(e){setText('status','Fehler bei der Prüfung');}
+}
+
+async function pollStatus(){
+    try{
+        const r=await fetch('/api/update/status?ts='+Date.now()); const j=await r.json();
+        updateInstallStatus(j);
+        setProgress(j.progress||0);
+        if(j.running || j.pending){
+            showResult('<span class="otaInfo">'+(j.status||'Update läuft...')+'</span>', 'otaInfo');
+            return;
+        }
+        if(j.error){
+            showResult('<span class="otaErr">'+(j.type||'Update')+' fehlgeschlagen<br>Fehler: '+j.error+'</span>', 'otaErr');
+            clearInterval(polling); polling=null; setButtons(true);
+            return;
+        }
+        if((j.progress||0)>=100){
+            showResult('<span class="otaOk">Update erfolgreich. Das Modul startet neu...</span>', 'otaOk');
+            clearInterval(polling); polling=null;
+            setTimeout(()=>location.reload(),45000);
+        }
+    }catch(e){
+        showResult('<span class="otaInfo">Verbindung wurde getrennt. Das ist während des Neustarts normal. Bitte 60-90 Sekunden warten und danach diese Seite neu laden.</span>','otaInfo');
+        clearInterval(polling); polling=null;
+    }
+}
+
+async function startUpdate(type){
+    var text=type==='littlefs'?'LittleFS / Weboberfläche':'Firmware';
+    if(!confirm(text+' jetzt aktualisieren?\n\nWährend des Updates bitte nicht vom Strom trennen.'))return;
+    setButtons(false); setProgress(0); showResult('<span class="otaInfo">'+text+' Update wird gestartet...</span>','otaInfo');
+    var force=document.getElementById('force').checked?'?force=1':'';
+    try{
+        const r=await fetch('/api/update/'+type+force,{method:'POST'}); const j=await r.json();
+        if(j.ok){showResult('<span class="otaInfo">'+j.message+'</span>','otaInfo'); if(polling)clearInterval(polling); polling=setInterval(pollStatus,1500);}
+        else{showResult('<span class="otaErr">Fehler: '+(j.error||'Update konnte nicht gestartet werden')+'</span>','otaErr'); setButtons(true);}
+    }catch(e){showResult('<span class="otaErr">Fehler beim Starten des Updates</span>','otaErr'); setButtons(true);}
+}
+
+checkUpdate();
+setTimeout(pollStatus, 1000);
+</script>
+</body>
+</html>
