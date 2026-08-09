@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SmartAndRelax | Open Source &amp; Lizenzhinweise</title>
+    <meta charset="utf-8">
+    <link rel="icon" type="image/png" sizes="180x180" href="favicon.png">
+    <meta name="theme-color" content="#0f4677">
+    <link rel="stylesheet" href="main.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1 maximum-scale=1">
+</head>
+<body>
+<div id="site">
+    <header>
+        <form id="darkModeForm">
+            <label class="switch">
+                <input type="checkbox" id="darkModeToggle" onchange="toggleDarkMode()">
+                <span class="slider round"></span>
+            </label>
+        </form>
+        <a href="updateonline.html">
+            <div id="header"><span>Open Source &amp; Lizenzhinweise</span><span>smartandrelax</span></div>
+        </a>
+        <a href="javascript:void(0);" class="topnavicon" onclick="topNav()"></a>
+    </header>
+
+    <div class="topnav" id="topnav">
+        <a href="./">Hauptseite</a>
+        <a href="hwconfig.html">Hardware-Konfiguration</a>
+        <a href="config.html">SPA-Konfiguration</a>
+        <a href="webconfig.html">Web-Konfiguration</a>
+        <a href="wifi.html">Netzwerkkonfiguration</a>
+        <a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
+        <a href="updateonline.html">Online Update</a>
+        <a href="/restart/">SmartAndRelax Modul neu starten</a>
+    </div>
+
+    <section>
+        <h2>Open Source &amp; Lizenzhinweise</h2>
+        <p>
+            SmartAndRelax basiert auf dem Open-Source-Projekt
+            <strong>WiFi remote for Bestway Lay-Z-SPA</strong> von
+            <strong>visualapproach</strong> und weiteren Mitwirkenden.
+        </p>
+        <p>
+            SmartAndRelax wurde für das SmartAndRelax-Projekt verändert und erweitert.
+        </p>
+    </section>
+
+    <section>
+        <h2>GNU General Public License v3.0</h2>
+        <p>
+            SmartAndRelax wird unter den Bedingungen der
+            <strong>GNU General Public License Version 3 (GPL-3.0)</strong> bereitgestellt.
+        </p>
+        <p>
+            Sie dürfen die Software unter den Bedingungen der GPL-3.0 verwenden,
+            untersuchen, verändern und weitergeben. Für die Weitergabe und Veränderung
+            gelten die Bedingungen der GNU GPL v3.0.
+        </p>
+        <p>
+            Die Software wird im Rahmen der gesetzlichen Möglichkeiten
+            <strong>ohne Gewährleistung</strong> bereitgestellt. Einzelheiten ergeben sich
+            aus dem vollständigen Lizenztext der GNU GPL v3.0.
+        </p>
+        <p class="center">
+            <a class="button" href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener">
+                GNU GPL v3.0 anzeigen
+            </a>
+        </p>
+    </section>
+
+    <section>
+        <h2>Quellcode &amp; Projektursprung</h2>
+        <p>
+            Der vollständige SmartAndRelax-Quellcode sowie historische Quellstände
+            und weitere Lizenz- und Urheberhinweise sind im öffentlichen
+            GitHub-Repository verfügbar.
+        </p>
+        <p class="center">
+            <a class="button" href="https://github.com/Innovations-MK/SmartAndRelax-Modul" target="_blank" rel="noopener">
+                SmartAndRelax Quellcode
+            </a>
+        </p>
+        <p class="center">
+            <a class="button" href="https://github.com/visualapproach/WiFi-remote-for-Bestway-Lay-Z-SPA" target="_blank" rel="noopener">
+                Originalprojekt von visualapproach
+            </a>
+        </p>
+    </section>
+
+    <section>
+        <h2>Urheber- &amp; Änderungshinweise</h2>
+        <p>
+            Bestehende Urheber-, Autoren- und Lizenzhinweise des ursprünglichen
+            Projekts und der enthaltenen Open-Source-Komponenten bleiben gültig.
+        </p>
+        <p>
+            Änderungen und Erweiterungen für SmartAndRelax werden im öffentlichen
+            Quellcode und in der zugehörigen Versionsdokumentation nachvollziehbar
+            dokumentiert.
+        </p>
+    </section>
+
+    <section>
+        <p class="center">
+            <a class="button" href="updateonline.html">Zurück zum Online Update</a>
+        </p>
+    </section>
+
+    <footer>
+        <p class="center">SmartAndRelax Open Source &amp; Lizenzhinweise</p>
+    </footer>
+</div>
+
+<script src="darkmode.js"></script>
+<script>
+function topNav(){
+    var x=document.getElementById("topnav");
+    if(x.className==="topnav") x.className+=" responsive";
+    else x.className="topnav";
+}
+</script>
+</body>
+</html>
