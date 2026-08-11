@@ -27,14 +27,15 @@
     </header>
 
     <div class="topnav" id="topnav">
-        <a href="./">Hauptseite</a>
-        <a href="hwconfig.html">Hardware-Konfiguration</a>
-        <a href="config.html">SPA-Konfiguration</a>
-        <a href="webconfig.html">Web-Konfiguration</a>
-        <a href="wifi.html">Netzwerkkonfiguration</a>
-        <a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
-        <a href="updateonline.html" class="active">Online Update</a>
-        <a href="/restart/">SmartAndRelax Modul neu starten</a>
+			<a href="./">Hauptseite</a>
+			<a href="hwconfig.html">Hardware-Konfiguration</a>
+			<a href="smartschedule.html">Smart Schedule</a>
+        	<a href="config.html">SPA-Konfiguration</a>
+			<a href="webconfig.html">Web-Konfiguration</a>
+			<a href="wifi.html">Netzwerkkonfiguration</a>
+			<a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
+			<a href="updateonline.html" class="active">Online Update</a>
+			<a href="/restart/">SmartAndRelax Modul neu starten<a>
     </div>
 
     <section>
@@ -77,9 +78,20 @@
     </section>
 
     <section>
-        <h2>Hinweis</h2>
-        <p>Nach erfolgreichem Update startet das Modul automatisch neu. Die Verbindung zur Seite kann dabei abbrechen.</p>
-        <p>Die Update-Dateien werden von <strong>GitHub / jsDelivr</strong> geladen.</p>
+        <h2>Wichtige Hinweise vor dem Update</h2>
+        <p><strong>Bitte das Update nur durchführen, wenn der Whirlpool gerade nicht aktiv genutzt wird.</strong></p>
+        <p>Während des Updates startet das Modul automatisch neu. Dadurch kann die Verbindung zur Seite kurz abbrechen und die Steuerung ist währenddessen nicht verfügbar.</p>
+        <p><strong>Vor dem Update bitte an der Pumpe alle Funktionen ausschalten:</strong> Filterpumpe, Heizung, Blubber/Massage und weitere aktive Funktionen.</p>
+        <p><strong>Wichtig:</strong> Während des Updates das Modul und die Pumpe nicht vom Strom trennen.</p>
+        <p><strong>Empfohlene Reihenfolge:</strong></p>
+        <p>1. zuerst <strong>LittleFS / Weboberfläche</strong> aktualisieren</p>
+        <p>2. Neustart des Moduls abwarten und diese Seite erneut öffnen</p>
+        <p>3. danach <strong>Firmware</strong> aktualisieren</p>
+        <p>4. erneuten Neustart des Moduls abwarten</p>
+        <p><strong>Bitte LittleFS und Firmware nicht gleichzeitig starten.</strong></p>
+        <p>Nach einem Firmware-Update müssen die Einstellungen im Modul gegebenenfalls neu vorgenommen und gespeichert werden.</p>
+        <p><strong>Wichtig nach dem Firmware-Update:</strong> Das Pumpendisplay kann zunächst inaktiv bleiben. Bitte unter <strong>Hardware-Konfiguration</strong> das richtige Pumpenmodell wieder auswählen, speichern und anschließend das Modul neu starten.</p>
+        <p>Sollte ein Update durch Internet-, WLAN- oder Stromunterbrechung fehlschlagen, kann die Firmware auf der Homepage unter <strong>www.mk-innovations.de/downloads/</strong> heruntergeladen und per USB neu geflasht werden.</p>
     </section>
 
     <footer><p class="center">SmartAndRelax Online Update</p></footer>
@@ -91,6 +103,12 @@ let polling = null;
 function topNav(){var x=document.getElementById("topnav"); if(x.className==="topnav")x.className+=" responsive"; else x.className="topnav";}
 function setText(id,value){document.getElementById(id).innerText=value||"-";}
 function showResult(html, cls){let r=document.getElementById('result'); r.style.display='block'; r.className='otaBox '+(cls||''); r.innerHTML=html;}
+function friendlyError(e){
+    let t=String(e||'');
+    if(t.indexOf('-4')>=0 || t.toLowerCase().indexOf('not connected')>=0) return 'Verbindung momentan nicht möglich – bitte erneut versuchen.';
+    if(t.toLowerCase().indexOf('failed to fetch')>=0) return 'Netzwerk kurzzeitig nicht erreichbar. Bitte die Seite neu laden oder erneut versuchen.';
+    return t || 'Unbekannter Fehler';
+}
 function setButtons(en){document.getElementById('btnfs').disabled=!en; document.getElementById('btnfw').disabled=!en;}
 function setProgress(p){document.getElementById('barwrap').style.display='block'; document.getElementById('bar').style.width=Math.max(0,Math.min(100,p||0))+'%';}
 function fmtBytes(n){n=Number(n||0); if(!n)return ''; if(n>900000)return ' ('+Math.round(n/1024)+' KB)'; return ' ('+n+' Bytes)';}
@@ -108,10 +126,10 @@ async function checkUpdate(){
         const r=await fetch('/api/update/check?ts='+Date.now()); const j=await r.json();
         updateInstallStatus(j);
         setText('current',j.current); setText('latest',j.latest); setText('notes',j.notes);
-        if(!j.ok){setText('status','Fehler: '+(j.error||'Versionsprüfung fehlgeschlagen')); return;}
+        if(!j.ok){setText('status','Fehler: '+friendlyError(j.error||'Versionsprüfung fehlgeschlagen')); return;}
         setText('status',j.updateAvailable?'Neue Version verfügbar':'Keine neuere Version gefunden');
         setButtons(true);
-    }catch(e){setText('status','Fehler bei der Prüfung');}
+    }catch(e){setText('status','Verbindung momentan nicht möglich – bitte erneut versuchen.');}
 }
 
 async function pollStatus(){
@@ -124,7 +142,7 @@ async function pollStatus(){
             return;
         }
         if(j.error){
-            showResult('<span class="otaErr">'+(j.type||'Update')+' fehlgeschlagen<br>Fehler: '+j.error+'</span>', 'otaErr');
+            showResult('<span class="otaErr">'+(j.type||'Update')+' fehlgeschlagen<br>'+friendlyError(j.error)+'</span>', 'otaErr');
             clearInterval(polling); polling=null; setButtons(true);
             return;
         }
@@ -147,8 +165,8 @@ async function startUpdate(type){
     try{
         const r=await fetch('/api/update/'+type+force,{method:'POST'}); const j=await r.json();
         if(j.ok){showResult('<span class="otaInfo">'+j.message+'</span>','otaInfo'); if(polling)clearInterval(polling); polling=setInterval(pollStatus,1500);}
-        else{showResult('<span class="otaErr">Fehler: '+(j.error||'Update konnte nicht gestartet werden')+'</span>','otaErr'); setButtons(true);}
-    }catch(e){showResult('<span class="otaErr">Fehler beim Starten des Updates</span>','otaErr'); setButtons(true);}
+        else{showResult('<span class="otaErr">'+friendlyError(j.error||'Update konnte nicht gestartet werden')+'</span>','otaErr'); setButtons(true);}
+    }catch(e){showResult('<span class="otaErr">Verbindung momentan nicht möglich – bitte erneut versuchen.</span>','otaErr'); setButtons(true);}
 }
 
 checkUpdate();
