@@ -25,7 +25,7 @@ function validatePassword(id) {
   return true;
 }
 
-// Function to update the displayed number
+                                          
 function updateNumber(opt, parent) {
   var parentElement = parent.parentElement;
   var numDisplay = parentElement.querySelector(".numDisplay");

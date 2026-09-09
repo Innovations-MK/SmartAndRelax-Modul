@@ -1,16 +1,16 @@
-/*
-    THIS FILE IS NOT USED ANYMORE. IT IS MERGED INTO INDEX.HTML FILE
-*/
+  
+                                                                    
+  
 
 
 
 
 
 
-// the web socket connection
+                            
 var connection;
 
-// command mapping
+                  
 const cmdMap = {
   setTarget: 0,
   setTargetSelector: 0,
@@ -18,9 +18,9 @@ const cmdMap = {
   toggleBubbles: 2,
   toggleHeater: 3,
   togglePump: 4,
-  //resetq: 5,
+              
   restartEsp: 6,
-  //gettarget: 7,
+                 
   resetTotals: 8,
   resetTimerChlorine: 9,
   resetTimerReplaceFilter: 10,
@@ -39,10 +39,12 @@ const cmdMap = {
   setReady: 20,
   setR: 21,
   resetTimerRinseFilter: 22,
-  resetTimerCleanFilter: 23
+  resetTimerCleanFilter: 23,
+  setPower: 24,
+  setLock: 25
 };
 
-// button element ID mapping
+                            
 const btnMap = {
   toggleUnit: "UNT",
   toggleBubbles: "AIR",
@@ -52,19 +54,19 @@ const btnMap = {
   toggleGodmode: "GOD"
 };
 
-// to be used for setting the control values once after loading original values from the web socket
+                                                                                                   
 var initControlValues = true;
 
-// display brightness multiplier. lower value results lower brightness levels (1-30)
+                                                                                    
 const dspBrtMultiplier = 16;
 
-// update states
+                
 updateTempState = false;
 updateAmbState = false;
 updateBrtState = false;
 
-// initial connect to the web socket
-// connect();
+                                    
+             
 
 function connect() {
   connection = new WebSocket("ws://" + location.hostname + ":81/", ["arduino"]);
@@ -105,10 +107,10 @@ function tryParseJSONObject(jsonString) {
   try {
     var o = JSON.parse(jsonString);
 
-    // Handle non-exception-throwing cases:
-    // Neither JSON.parse(false) or JSON.parse(1234) throw errors, hence the type-checking,
-    // but... JSON.parse(null) returns null, and typeof null === "object",
-    // so we must check for that, too. Thankfully, null is falsey, so this suffices:
+                                           
+                                                                                           
+                                                                          
+                                                                                    
     if (o && typeof o === "object") {
       return o;
     }
@@ -124,40 +126,40 @@ function handlemsg(e) {
   console.log(msgobj);
 
   if (msgobj.CONTENT == "OTHER") {
-    // MQTT status
+                  
     mqtt_states = [
-      "CONNECTION_TIMEOUT", // -4 / the server didn't respond within the keepalive time
-      "CONNECTION_LOST", // -3 / the network connection was broken
-      "CONNECT_FAILED", // -2 / the network connection failed
-      "DISCONNECTED", // -1 / the client is disconnected cleanly
-      "CONNECTED", // 0 / the client is connected
-      "CONNECT_BAD_PROTOCOL", // 1 / the server doesn't support the requested version of MQTT
-      "CONNECT_BAD_CLIENT_ID", // 2 / the server rejected the client identifier
-      "CONNECT_UNAVAILABLE", // 3 / the server was unable to accept the connection
-      "CONNECT_BAD_CREDENTIALS", // 4 / the username/password were rejected
-      "CONNECT_UNAUTHORIZED", // 5 / the client was not authorized to connect
+      "CONNECTION_TIMEOUT",                                                            
+      "CONNECTION_LOST",                                          
+      "CONNECT_FAILED",                                      
+      "DISCONNECTED",                                           
+      "CONNECTED",                               
+      "CONNECT_BAD_PROTOCOL",                                                                
+      "CONNECT_BAD_CLIENT_ID",                                                 
+      "CONNECT_UNAVAILABLE",                                                      
+      "CONNECT_BAD_CREDENTIALS",                                           
+      "CONNECT_UNAUTHORIZED",                                                
     ];
     document.getElementById("mqtt").innerHTML = "MQTT: " + mqtt_states[msgobj.MQTT + 4];
     document.getElementById("fw").innerHTML = "Firmware: " + msgobj.FW;
     document.getElementById("model").innerHTML = "Model: " + msgobj.MODEL;
     document.getElementById("rssi").innerHTML = "RSSI: " + msgobj.RSSI;
 
-    // hydro jets available
+                           
     document.getElementById("jets").style.display = msgobj.HASJETS ? "table-cell" : "none";
     document.getElementById("jetsswitch").style.display = msgobj.HASJETS ? "table-cell" : "none";
     document.getElementById("jetstotals").style.display = msgobj.HASJETS ? "table-cell" : "none";
-    // godmode available
+                        
     document.getElementById("god").style.display = msgobj.HASGOD ? "table-cell" : "none";
     document.getElementById("godswitch").style.display = msgobj.HASGOD ? "table-cell" : "none";
   }
 
   if (msgobj.CONTENT == "STATES") {
-    // temperature
+                  
     document.getElementById("atlabel").innerHTML = msgobj.TMP.toString();
     document.getElementById("vtlabel").innerHTML = msgobj.VTM.toFixed(2).toString();
     document.getElementById("ttlabel").innerHTML = msgobj.TGT.toString();
 
-    // buttons
+              
     document.getElementById("AIR").checked = msgobj.AIR;
     if (document.getElementById("UNT").checked != msgobj.UNT) {
       document.getElementById("UNT").checked = msgobj.UNT;
@@ -168,18 +170,18 @@ function handlemsg(e) {
     document.getElementById("GOD").checked = msgobj.GOD;
     document.getElementById("HTR").checked = msgobj.RED || msgobj.GRN;
 
-    // heater button color
+                          
     document.getElementById("htrspan").classList.remove("heateron");
     document.getElementById("htrspan").classList.remove("heateroff");
     if (msgobj.RED || msgobj.GRN) {
       document.getElementById("htrspan").classList.add(msgobj.RED ? "heateron" : msgobj.GRN ? "heateroff" : "n-o-n-e");
     }
 
-    // display
+              
     document.getElementById("display").innerHTML = "[" + String.fromCharCode(msgobj.CH1, msgobj.CH2, msgobj.CH3) + "]";
     document.getElementById("display").style.color = rgb(255 - dspBrtMultiplier * 8 + dspBrtMultiplier * (parseInt(msgobj.BRT) + 1), 0, 0);
 
-    // set control values (once)
+                                
     if (initControlValues) {
       var minTemp = msgobj.UNT ? 20 : 68;
       var maxTemp = msgobj.UNT ? 40 : 104;
@@ -205,13 +207,13 @@ function handlemsg(e) {
     document.getElementById("sliderAmbVal").innerHTML = msgobj.AMB;
     document.getElementById("sliderBrtVal").innerHTML = msgobj.BRT;
 
-    // get selector elements
+                            
     var elemSelectorTemp = document.getElementById("selectorTemp");
     var elemSelectorAmb = document.getElementById("selectorAmb");
     var elemSelectorBrt = document.getElementById("selectorBrt");
 
-    // change values only if element is not active (selected for input)
-    // also change only if an update is not in progress
+                                                                       
+                                                       
     if (document.activeElement !== elemSelectorTemp && !updateTempState) {
       elemSelectorTemp.value = msgobj.TGT;
       elemSelectorTemp.parentElement.querySelector(".numDisplay").textContent = msgobj.TGT;
@@ -222,7 +224,7 @@ function handlemsg(e) {
     }
     if (document.activeElement !== elemSelectorBrt && !updateBrtState) elemSelectorBrt.value = msgobj.BRT;
 
-    // reset update states when the set target matches the input
+                                                                
     if (elemSelectorTemp.value == msgobj.TGT) updateTempState = false;
     if (elemSelectorAmb.value == msgobj.AMB) updateAmbState = false;
     if (elemSelectorBrt.value == msgobj.BRT) updateBrtState = false;
@@ -232,31 +234,31 @@ function handlemsg(e) {
     var date = new Date(msgobj.TIME * 1000);
     document.getElementById("time").innerHTML = date.toLocaleString();
 
-    // chlorine add reset timer
+                               
     var clDate = (Date.now() / 1000 - msgobj.CLTIME) / (24 * 3600.0);
     var clDateRound = Math.round(clDate);
     document.getElementById("cltimer").innerHTML = clDateRound + " Tag" + (clDateRound != 1 ? "en" : "");
     document.getElementById("cltimerbtn").className = clDate > msgobj.CLINT ? "button_red" : "button";
 
-    // filter change reset timer
+                                
     var fDate = (Date.now() / 1000 - msgobj.FREP) / (24 * 3600.0);
     var fDateRound = Math.round(fDate);
     document.getElementById("freplacetimer").innerHTML = fDateRound + " Tag" + (fDateRound != 1 ? "en" : "");
     document.getElementById("freplacetimerbtn").className = fDate > msgobj.FREPI ? "button_red" : "button";
 
-    // filter clean reset timer
+                               
     var fDate = (Date.now() / 1000 - msgobj.FCLE) / (24 * 3600.0);
     var fDateRound = Math.round(fDate);
     document.getElementById("fcleantimer").innerHTML = fDateRound + " Tag" + (fDateRound != 1 ? "en" : "");
     document.getElementById("fcleantimerbtn").className = fDate > msgobj.FCLEI ? "button_red" : "button";
 
-    // filter rinse reset timer
+                               
     var fDate = (Date.now() / 1000 - msgobj.FRIN) / (24 * 3600.0);
     var fDateRound = Math.round(fDate);
     document.getElementById("frinsetimer").innerHTML = fDateRound + " Tag" + (fDateRound != 1 ? "en" : "");
     document.getElementById("frinsetimerbtn").className = fDate > msgobj.FRINI ? "button_red" : "button";
 
-    // statistics
+                 
     document.getElementById("heatingtime").innerHTML = s2dhms(msgobj.HEATINGTIME);
     document.getElementById("uptime").innerHTML = s2dhms(msgobj.UPTIME);
     document.getElementById("airtime").innerHTML = s2dhms(msgobj.AIRTIME);
@@ -285,16 +287,16 @@ function s2dhms(val) {
 function sendCommand(cmd) {
   console.log(cmd);
   console.log(typeof cmdMap[cmd]);
-  // check command
+                  
   if (typeof cmdMap[cmd] == "undefined") {
     console.log("invalid command");
     return;
   }
 
-  // get the current unit (true=C, false=F)
+                                           
   var unit = document.getElementById("UNT").checked;
 
-  // get and set value
+                      
   var value = 0;
   if (cmd == "setTarget" || cmd == "setTargetSelector") {
     value = parseInt(document.getElementById(cmd == "setTarget" ? "temp" : "selectorTemp").value);

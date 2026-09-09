@@ -298,12 +298,12 @@ void CIO_4W::regulateTemp()
 
 void CIO_4W::antifreeze()
 {
-    /*
-        Antifreeze. This will only run in GODMODE.
-        In normal mode the pump should behave as from factory.
-        - Will start pump and heater and set target temperature to 10.
-        - Pump will run until "manually" turned off. (From Panel, Web UI or MQTT)
-    */
+      
+                                                  
+                                                              
+                                                                      
+                                                                                 
+      
     int tempC = cio_states.temperature;
     int targetC;
     if(!cio_states.unit) tempC = F2C(tempC);

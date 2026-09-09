@@ -3,11 +3,11 @@
 #include "pitches.h"
 #include <algorithm>
 
-// --- CMDQ save debounce / change-detect ---
+
 static uint32_t g_cmdq_last_save_ms = 0;
 static uint32_t g_cmdq_last_hash = 0;
 
-// kleine, schnelle Hash-Funktion (FNV-1a 32bit)
+
 static uint32_t fnv1a32(const uint8_t* data, size_t len) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < len; i++) {
@@ -20,7 +20,7 @@ static uint32_t fnv1a32(const uint8_t* data, size_t len) {
 
 BWC::BWC()
 {
-    //Initialize variables
+    
 
     _dsp_brightness = 7;
     _cl_timestamp_s = time(nullptr);
@@ -39,6 +39,8 @@ BWC::BWC()
     _cl_interval = 14;
     _audio_enabled = true;
     _restore_states_on_start = false;
+    _notification_time = 32;
+    _next_notification_time = 32;
     _ambient_temp = 20;
     _virtual_temp_fix = -99;
 }
@@ -71,6 +73,666 @@ void BWC::on_scroll_text()
     _scroll = true;
 }
 
+
+static const char* SAR_SAFE_STATES_FILE = "/safe_states.txt";
+static const uint32_t SAR_RECENT_COMMAND_WINDOW_MS = 15000UL;
+static const uint32_t SAR_RECENT_BUTTON_WINDOW_MS  = 15000UL;
+static const uint32_t SAR_RESTORE_MIN_GAP_MS       = 8000UL;
+
+
+static const uint32_t SAR_PUMP_OFF_OBSERVE_MS      = 30000UL;
+static const uint32_t SAR_RECENT_TARGET_WINDOW_MS  = 30000UL;
+static const uint32_t SAR_TARGET_RESTORE_DELAY_MS   = 20000UL;
+static const uint32_t SAR_TARGET_RESTORE_GAP_MS     = 60000UL;
+
+
+void BWC::beginCloudPollingGuard(uint32_t maxActiveMs)
+{
+    const uint32_t now = millis();
+    if(!cloudPollingGuardActive())
+    {
+        _cloud_poll_guard_started_ms = now;
+        _cloud_poll_guard_count++;
+
+        
+        
+        if(cio != nullptr)
+        {
+            _cloud_pre_pump = cio->cio_states.pump ? 1 : 0;
+            _cloud_pre_heat = cio->cio_states.heat ? 1 : 0;
+            _cloud_pre_state_valid = true;
+        }
+        else
+        {
+            _cloud_pre_state_valid = false;
+        }
+        _cloud_post_restore_pending = false;
+    }
+    _cloud_poll_guard_until_ms = now + maxActiveMs;
+}
+
+void BWC::finishCloudPollingGuard(uint32_t recoveryMs)
+{
+    const uint32_t now = millis();
+    if(_cloud_poll_guard_started_ms != 0)
+    {
+        _cloud_poll_guard_active_ms_last = (uint32_t)(now - _cloud_poll_guard_started_ms);
+        if(_cloud_poll_guard_active_ms_last > _cloud_poll_guard_active_ms_max)
+            _cloud_poll_guard_active_ms_max = _cloud_poll_guard_active_ms_last;
+    }
+    _cloud_poll_guard_until_ms = now + recoveryMs;
+    _cloud_post_restore_pending = _cloud_pre_state_valid;
+}
+
+bool BWC::cloudPollingGuardActive() const
+{
+    return _cloud_poll_guard_until_ms != 0 && (int32_t)(_cloud_poll_guard_until_ms - millis()) > 0;
+}
+
+
+void BWC::_enforcePostCloudStateRestore()
+{
+    if(!_cloud_post_restore_pending || cloudPollingGuardActive()) return;
+
+    
+    
+    
+    _cloud_post_restore_pending = false;
+
+    if(!_cloud_pre_state_valid || cio == nullptr)
+    {
+        _cloud_pre_state_valid = false;
+        return;
+    }
+
+    bool queued = false;
+
+    if(_cloud_pre_pump == 1 &&
+       cio->cio_states.pump == 0 &&
+       !_recentCommandedOff(false) &&
+       !_recentPhysicalOffButton(false))
+    {
+        queued |= _queueStateRestoreCommand(SETPUMP, 1);
+    }
+
+    if(_cloud_pre_heat == 1 &&
+       cio->cio_states.heat == 0 &&
+       !_recentCommandedOff(true) &&
+       !_recentPhysicalOffButton(true))
+    {
+        
+        if(cio->cio_states.pump == 0)
+            queued |= _queueStateRestoreCommand(SETPUMP, 1);
+        queued |= _queueStateRestoreCommand(SETHEATER, 1);
+    }
+
+    if(queued)
+    {
+        _last_live_restore_ms = millis();
+        _live_safe_restore_count++;
+    }
+
+    _cloud_pre_state_valid = false;
+}
+
+bool BWC::_loadPersistentSafeStates()
+{
+    File file = LittleFS.open(F("/safe_states.txt"), "r");
+    if(!file) return false;
+
+    StaticJsonDocument<192> doc;
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+    if(error) return false;
+
+    uint8_t flt = doc[F("FLT")] | 0;
+    uint8_t htr = doc[F("HTR")] | 0;
+    uint8_t tgt = doc[F("TGT")] | 20;
+    uint8_t unt = doc[F("UNT")] | 1; 
+    uint8_t god = doc[F("GOD")] | 0;
+
+    if(flt > 1 || htr > 1) return false;
+    unt = unt ? 1 : 0;
+    if(!_targetIsPlausibleForUnit(tgt, unt)) tgt = unt ? 20 : 68;
+
+    _last_safe_pump = flt;
+    _last_safe_heat = htr;
+    _last_safe_target = tgt;
+    _last_safe_unit = unt;
+    _last_safe_god = god ? 1 : 0;
+    _has_last_safe_states = true;
+    return true;
+}
+
+void BWC::_savePersistentSafeStates()
+{
+    if(!_has_last_safe_states) return;
+
+    File file = LittleFS.open(F("/safe_states.txt"), "w");
+    if(!file) return;
+
+    StaticJsonDocument<192> doc;
+    doc[F("FLT")] = _last_safe_pump;
+    doc[F("HTR")] = _last_safe_heat;
+    doc[F("TGT")] = _last_safe_target;
+    doc[F("UNT")] = _last_safe_unit;
+    doc[F("GOD")] = _last_safe_god;
+
+    serializeJson(doc, file);
+    file.close();
+}
+
+void BWC::_updateLastKnownSafeStates()
+{
+    if(cloudPollingGuardActive()) return;
+    if(cio == nullptr) return;
+
+    const uint8_t pump = cio->cio_states.pump ? 1 : 0;
+    const uint8_t heat = cio->cio_states.heat ? 1 : 0;
+    const uint8_t target = _guardedTargetForSave();
+
+    
+    
+    
+    if(!_targetIsPlausibleForUnit(target, cio->cio_states.unit)) return;
+
+    _last_safe_pump = pump;
+    _last_safe_heat = heat;
+    _setLastSafeTargetFromCurrentUnit(target);
+    _last_safe_god = cio->cio_states.godmode ? 1 : 0;
+    _has_last_safe_states = true;
+    _savePersistentSafeStates();
+}
+
+bool BWC::_recentCommandedOff(bool heater) const
+{
+    const uint32_t now = millis();
+    if(heater)
+        return (_last_heat_cmd_val == 0 && _last_heat_cmd_ms != 0 && (uint32_t)(now - _last_heat_cmd_ms) < SAR_RECENT_COMMAND_WINDOW_MS);
+    return (_last_pump_cmd_val == 0 && _last_pump_cmd_ms != 0 && (uint32_t)(now - _last_pump_cmd_ms) < SAR_RECENT_COMMAND_WINDOW_MS);
+}
+
+bool BWC::_recentPhysicalOffButton(bool heater) const
+{
+    const uint32_t now = millis();
+    if(heater)
+        return (_last_heat_button_ms != 0 && (uint32_t)(now - _last_heat_button_ms) < SAR_RECENT_BUTTON_WINDOW_MS);
+    return (_last_pump_button_ms != 0 && (uint32_t)(now - _last_pump_button_ms) < SAR_RECENT_BUTTON_WINDOW_MS);
+}
+
+bool BWC::_heatRestoreAllowedByTemp() const
+{
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    return true;
+}
+
+bool BWC::_recentTargetChangeIntent() const
+{
+    const uint32_t now = millis();
+
+    if(_last_target_cmd_ms != 0 && (uint32_t)(now - _last_target_cmd_ms) < SAR_RECENT_TARGET_WINDOW_MS)
+        return true;
+
+    if(_last_target_button_ms != 0 && (uint32_t)(now - _last_target_button_ms) < SAR_RECENT_TARGET_WINDOW_MS)
+        return true;
+
+    return false;
+}
+
+bool BWC::_targetIsPlausibleForUnit(uint8_t target, bool unitIsCelsius) const
+{
+    if(unitIsCelsius)
+        return (target >= 20 && target <= 40);
+
+    
+    
+    
+    
+    return (target > 50 && target < 105);
+}
+
+uint8_t BWC::_convertTargetToUnit(uint8_t target, bool fromUnitIsCelsius, bool toUnitIsCelsius) const
+{
+    if(fromUnitIsCelsius == toUnitIsCelsius)
+        return target;
+
+    return toUnitIsCelsius ? (uint8_t)round(F2C((float)target))
+                           : (uint8_t)round(C2F((float)target));
+}
+
+uint8_t BWC::_lastSafeTargetForCurrentUnit() const
+{
+    if(cio == nullptr) return _last_safe_target;
+    return _convertTargetToUnit(_last_safe_target, _last_safe_unit, cio->cio_states.unit);
+}
+
+void BWC::_setLastSafeTargetFromCurrentUnit(uint8_t target)
+{
+    if(cio != nullptr) _last_safe_unit = cio->cio_states.unit ? 1 : 0;
+    _last_safe_target = target;
+}
+
+bool BWC::_targetLooksSuspicious(uint8_t target) const
+{
+    if(cio == nullptr)
+        return false;
+
+    if(!_targetIsPlausibleForUnit(target, cio->cio_states.unit))
+        return true;
+
+    
+    
+    if(!_has_last_safe_states)
+        return false;
+
+    if(target == _lastSafeTargetForCurrentUnit())
+        return false;
+
+    const uint32_t now = millis();
+
+    
+    
+    
+    if(_last_target_cmd_ms != 0 &&
+       (uint32_t)(now - _last_target_cmd_ms) < SAR_RECENT_TARGET_WINDOW_MS &&
+       _last_target_cmd_val >= 0 &&
+       target == (uint8_t)_last_target_cmd_val)
+    {
+        return false;
+    }
+
+    
+    
+    if(_last_target_button_ms != 0 &&
+       (uint32_t)(now - _last_target_button_ms) < SAR_RECENT_TARGET_WINDOW_MS)
+    {
+        return false;
+    }
+
+    
+    
+    
+    return true;
+}
+
+uint8_t BWC::_guardedTargetForSave() const
+{
+    if(cloudPollingGuardActive() && _has_last_safe_states)
+        return _lastSafeTargetForCurrentUnit();
+
+    if(cio == nullptr)
+        return _lastSafeTargetForCurrentUnit();
+
+    const uint8_t target = cio->cio_states.target;
+    if(_targetLooksSuspicious(target) && _has_last_safe_states)
+        return _lastSafeTargetForCurrentUnit();
+
+    return target;
+}
+
+bool BWC::_shouldBlockUnsafeStateSave() const
+{
+    if(cloudPollingGuardActive()) return true;
+    if(!_has_last_safe_states || cio == nullptr) return false;
+
+    if(_last_safe_pump == 1 && cio->cio_states.pump == 0 && !_recentCommandedOff(false) && !_recentPhysicalOffButton(false))
+        return true;
+
+    if(_last_safe_heat == 1 && cio->cio_states.heat == 0 && !_recentCommandedOff(true) && !_recentPhysicalOffButton(true))
+        return true;
+
+    return false;
+}
+
+void BWC::_clearInternalRestoreCommands(bool pump, bool heat)
+{
+    _command_que.erase(std::remove_if(_command_que.begin(), _command_que.end(),
+        [pump, heat](const command_que_item& item){
+            const bool isInternalRestore = (item.interval == 0 && item.xtime == 0 && item.text.length() == 0);
+            if(!isInternalRestore || item.val != 1) return false;
+            if(pump && item.cmd == SETPUMP) return true;
+            if(heat && item.cmd == SETHEATER) return true;
+            return false;
+        }),
+        _command_que.end());
+    _save_cmdq_needed = true;
+}
+
+bool BWC::_queueStateRestoreCommand(Commands cmd, uint8_t val)
+{
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    for(const auto& item : _command_que)
+    {
+        const bool isInternalRestore = (item.interval == 0 && item.xtime == 0 && item.text.length() == 0);
+        if(isInternalRestore && item.cmd == cmd && item.val == val)
+            return false;
+    }
+
+    command_que_item item;
+    item.cmd = cmd;
+    item.val = val;
+    item.xtime = 0;
+    item.interval = 0;
+    item.text = "";
+    return add_command(item);
+}
+
+void BWC::_enforceSafeLiveState(const char* reason)
+{
+    (void)reason;
+    if(cloudPollingGuardActive()) return;
+    if(!_has_last_safe_states || cio == nullptr) return;
+
+    const uint32_t now = millis();
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    const bool pumpLooksUnexpectedOff = (_last_safe_pump == 1 &&
+                                        cio->cio_states.pump == 0 &&
+                                        !_recentCommandedOff(false) &&
+                                        !_recentPhysicalOffButton(false));
+
+    const bool mayObservePurePumpOff = (pumpLooksUnexpectedOff && _last_safe_heat == 0);
+
+    if(mayObservePurePumpOff)
+    {
+        if(_pump_off_observe_since_ms == 0)
+        {
+            _pump_off_observe_since_ms = now;
+            return;
+        }
+
+        if((uint32_t)(now - _pump_off_observe_since_ms) < SAR_PUMP_OFF_OBSERVE_MS)
+            return;
+
+        
+        
+        _last_safe_pump = 0;
+        _last_safe_heat = 0;
+        _has_last_safe_states = true;
+        if(cio != nullptr)
+        {
+            _setLastSafeTargetFromCurrentUnit(_guardedTargetForSave());
+            _last_safe_god = cio->cio_states.godmode ? 1 : 0;
+        }
+        _pump_off_observe_since_ms = 0;
+        _last_live_restore_ms = now;
+        _clearInternalRestoreCommands(true, true);
+        _savePersistentSafeStates();
+        return;
+    }
+
+    
+    
+    if(cio->cio_states.pump != 0 || _recentCommandedOff(false) || _recentPhysicalOffButton(false) || _last_safe_heat == 1)
+        _pump_off_observe_since_ms = 0;
+
+    if(_last_live_restore_ms != 0 && (uint32_t)(now - _last_live_restore_ms) < SAR_RESTORE_MIN_GAP_MS)
+        return;
+
+    bool queued = false;
+
+    if(_last_safe_pump == 1 && cio->cio_states.pump == 0 && !_recentCommandedOff(false) && !_recentPhysicalOffButton(false))
+    {
+        queued |= _queueStateRestoreCommand(SETPUMP, 1);
+    }
+
+    
+    
+    if(_last_safe_heat == 1 && _last_safe_pump == 1 && cio->cio_states.heat == 0 && !_recentCommandedOff(true) && !_recentPhysicalOffButton(true))
+    {
+        if(_heatRestoreAllowedByTemp())
+        {
+            
+            if(cio->cio_states.pump == 0)
+                queued |= _queueStateRestoreCommand(SETPUMP, 1);
+            queued |= _queueStateRestoreCommand(SETHEATER, 1);
+        }
+    }
+
+    if(queued)
+    {
+        _last_live_restore_ms = now;
+        _live_safe_restore_count++;
+    }
+}
+
+
+void BWC::_enforceSafeTargetState(const char* reason)
+{
+    (void)reason;
+    if(cloudPollingGuardActive()) return;
+    if(!_has_last_safe_states || cio == nullptr) return;
+
+    const uint8_t liveTarget = cio->cio_states.target;
+    const uint32_t now = millis();
+
+    
+    
+    if(!_targetLooksSuspicious(liveTarget))
+    {
+        _target_suspicious_since_ms = 0;
+        return;
+    }
+
+    
+    
+    
+    
+
+    if(liveTarget == _lastSafeTargetForCurrentUnit())
+    {
+        _target_suspicious_since_ms = 0;
+        return;
+    }
+
+    if(_target_suspicious_since_ms == 0)
+    {
+        _target_suspicious_since_ms = now;
+        return;
+    }
+
+    if((uint32_t)(now - _target_suspicious_since_ms) < SAR_TARGET_RESTORE_DELAY_MS)
+        return;
+
+    if(_last_target_restore_ms != 0 && (uint32_t)(now - _last_target_restore_ms) < SAR_TARGET_RESTORE_GAP_MS)
+        return;
+
+    
+    
+    
+    
+    const bool queuedRead = _queueStateRestoreCommand(GETTARGET, 0);
+    const bool queuedSet  = _queueStateRestoreCommand(SETTARGET, _lastSafeTargetForCurrentUnit());
+    if(queuedRead || queuedSet)
+    {
+        _last_target_restore_ms = now;
+        _target_live_restore_count++;
+        
+        _target_suspicious_since_ms = 0;
+    }
+}
+
+void BWC::getPumpDiag(String &rtn)
+{
+    rtn += F("\n\n--- Pump state/command diag ---");
+
+    rtn += F("\nstateSaveGuardSkips: ");
+    rtn += String(_state_guard_skip_count);
+
+    rtn += F("\ncloudPollGuardActive: ");
+    rtn += cloudPollingGuardActive() ? F("1") : F("0");
+
+    rtn += F("\ncloudPollGuardRemainingMs: ");
+    rtn += String(cloudPollingGuardActive() ? (uint32_t)(_cloud_poll_guard_until_ms - millis()) : 0UL);
+
+    rtn += F("\ncloudPollGuardCount: ");
+    rtn += String(_cloud_poll_guard_count);
+
+    rtn += F("\ncloudPollGuardLastActiveMs: ");
+    rtn += String(_cloud_poll_guard_active_ms_last);
+
+    rtn += F("\ncloudPollGuardMaxActiveMs: ");
+    rtn += String(_cloud_poll_guard_active_ms_max);
+
+    rtn += F("\ncloudPollGuardStateSkips: ");
+    rtn += String(_cloud_poll_guard_state_skip_count);
+
+    rtn += F("\ncloudPollGuardSaveSkips: ");
+    rtn += String(_cloud_poll_guard_save_skip_count);
+
+    rtn += F("\nliveSafeRestoreCount: ");
+    rtn += String(_live_safe_restore_count);
+
+    rtn += F("\nlastLiveSafeRestoreAgeMs: ");
+    rtn += String((_last_live_restore_ms == 0) ? 0UL : (uint32_t)(millis() - _last_live_restore_ms));
+
+    rtn += F("\npumpOffObserveAgeMs: ");
+    rtn += String((_pump_off_observe_since_ms == 0) ? 0UL : (uint32_t)(millis() - _pump_off_observe_since_ms));
+
+    rtn += F("\ntargetLiveRestoreCount: ");
+    rtn += String(_target_live_restore_count);
+
+    rtn += F("\ntargetForceReadCount: ");
+    rtn += String(_target_force_read_count);
+
+    rtn += F("\nlastTargetRestoreAgeMs: ");
+    rtn += String((_last_target_restore_ms == 0) ? 0UL : (uint32_t)(millis() - _last_target_restore_ms));
+
+    rtn += F("\ntargetSuspiciousAgeMs: ");
+    rtn += String((_target_suspicious_since_ms == 0) ? 0UL : (uint32_t)(millis() - _target_suspicious_since_ms));
+
+    rtn += F("\nhasLastSafeStates: ");
+    rtn += _has_last_safe_states ? F("1") : F("0");
+
+    rtn += F("\nlastSafePump: ");
+    rtn += String(_last_safe_pump);
+
+    rtn += F("\nlastSafeHeat: ");
+    rtn += String(_last_safe_heat);
+
+    rtn += F("\nlastSafeTarget: ");
+    rtn += String(_last_safe_target);
+
+    rtn += F("\nlastSafeUnit: ");
+    rtn += String(_last_safe_unit);
+
+    rtn += F("\nlastSafeTargetCurrentUnit: ");
+    rtn += String(_lastSafeTargetForCurrentUnit());
+
+    rtn += F("\nheatRestoreAllowedByTemp: ");
+    rtn += _heatRestoreAllowedByTemp() ? F("1") : F("0");
+
+    rtn += F("\nlastSafeGod: ");
+    rtn += String(_last_safe_god);
+
+    rtn += F("\nlastPumpCmdVal: ");
+    rtn += String(_last_pump_cmd_val);
+
+    rtn += F("\nlastHeatCmdVal: ");
+    rtn += String(_last_heat_cmd_val);
+
+    rtn += F("\nlastTargetCmdVal: ");
+    rtn += String(_last_target_cmd_val);
+
+    rtn += F("\nlastPumpCmdAgeMs: ");
+    rtn += String((_last_pump_cmd_ms == 0) ? 0UL : (uint32_t)(millis() - _last_pump_cmd_ms));
+
+    rtn += F("\nlastHeatCmdAgeMs: ");
+    rtn += String((_last_heat_cmd_ms == 0) ? 0UL : (uint32_t)(millis() - _last_heat_cmd_ms));
+
+    rtn += F("\nlastTargetCmdAgeMs: ");
+    rtn += String((_last_target_cmd_ms == 0) ? 0UL : (uint32_t)(millis() - _last_target_cmd_ms));
+
+    rtn += F("\nlastPumpButtonAgeMs: ");
+    rtn += String((_last_pump_button_ms == 0) ? 0UL : (uint32_t)(millis() - _last_pump_button_ms));
+
+    rtn += F("\nlastHeatButtonAgeMs: ");
+    rtn += String((_last_heat_button_ms == 0) ? 0UL : (uint32_t)(millis() - _last_heat_button_ms));
+
+    rtn += F("\nlastTargetButtonAgeMs: ");
+    rtn += String((_last_target_button_ms == 0) ? 0UL : (uint32_t)(millis() - _last_target_button_ms));
+
+    if(cio != nullptr)
+    {
+        rtn += F("\nlivePumpState: ");
+        rtn += String(cio->cio_states.pump ? 1 : 0);
+
+        rtn += F("\nliveHeatState: ");
+        rtn += String(cio->cio_states.heat ? 1 : 0);
+
+        rtn += F("\nliveTargetState: ");
+        rtn += String(cio->cio_states.target);
+
+        rtn += F("\nactualPumpTargetForDisplay: ");
+        rtn += String(cio->cio_states.target);
+
+        rtn += F("\nguardedTargetForDisplay: ");
+        rtn += String(_guardedTargetForSave());
+
+        rtn += F("\nforceNextSetTarget: ");
+        rtn += _force_next_settarget ? F("1") : F("0");
+
+        rtn += F("\nliveBrightnessState: ");
+        rtn += String(cio->cio_states.brightness);
+
+        rtn += F("\nliveGodState: ");
+        rtn += String(cio->cio_states.godmode ? 1 : 0);
+
+        rtn += F("\ntargetLooksSuspicious: ");
+        rtn += _targetLooksSuspicious(cio->cio_states.target) ? F("1") : F("0");
+
+        rtn += F("\nguardedTargetForSave: ");
+        rtn += String(_guardedTargetForSave());
+
+        rtn += F("\ntargetChangeIntent: ");
+        rtn += _recentTargetChangeIntent() ? F("1") : F("0");
+    }
+    else
+    {
+        rtn += F("\nlivePumpState: -1");
+        rtn += F("\nliveHeatState: -1");
+        rtn += F("\nliveTargetState: -1");
+        rtn += F("\nliveBrightnessState: -1");
+        rtn += F("\nliveGodState: -1");
+        rtn += F("\ntargetLooksSuspicious: -1");
+        rtn += F("\nguardedTargetForSave: -1");
+        rtn += F("\ntargetChangeIntent: -1");
+    }
+}
+
+
 void BWC::setup(void){
     if(cio != nullptr) delete cio;
     if(dsp != nullptr) delete dsp;
@@ -89,10 +751,10 @@ void BWC::setup(void){
         pins[7] = D8;
         
     }
-    // Serial.printf("Cio loaded: %d, dsp model: %d\n", ciomodel, dspmodel);
+    
     for(int i = 0; i < 8; i++)
     {
-        // Serial.printf("pin%d: %d\n", i, pins[i]);
+        
     }
     {
         HeapSelectIram ephemeral;
@@ -176,15 +838,16 @@ void BWC::setup(void){
 }
 
 void BWC::begin(){
-    // _save_melody("melody.bin");
-    // if(_audio_enabled) dsp->playIntro();
-    // dsp->LEDshow();
+    
+    
+    
     _save_settings_ticker.attach(3600.0f, save_settings_cb, this);
     _scroll_text_ticker.attach(0.25f, scroll_text_cb, this);
 
     _next_notification_time = _notification_time;
     loadCommandQueue();
     _loadSettings();
+    _loadPersistentSafeStates();
     _restoreStates();
     _loadSmartSchedule();
 }
@@ -192,7 +855,7 @@ void BWC::begin(){
 
 void BWC::loop(){
     ++loop_count;
-    // if(loop_count % 100 == 0) Serial.printf_P(PSTR("bwc loop %d\n"), millis());
+    
     #ifdef ESP8266
     ESP.wdtFeed();
     #endif
@@ -203,18 +866,27 @@ void BWC::loop(){
         dsp->text.remove(0,1);
         _scroll = false;
     }
-    cio->updateStates();                //checking serial line
-    dsp->dsp_states = cio->cio_states;  //
+    cio->updateStates();                
+    dsp->dsp_states = cio->cio_states;  
     
-    /*Modify and use dsp->dsp_states here if we want to show text or something*/
+    
     dsp->setRawPayload(cio->getRawPayload());
     dsp->setSerialReceived(cio->getSerialReceived());
-    /*Increase screen brightness when pressing buttons*/
+    
     adjust_brightness();
 
-    dsp->handleStates();                //transmits to dsp if serial received from cio
-    dsp->updateToggles();               //checking serial line
+    dsp->handleStates();                
+    dsp->updateToggles();               
+
+    
+    
+    
+    
+    if(dsp->dsp_toggles.pressed_button == PUMP) _last_pump_button_ms = millis();
+    if(dsp->dsp_toggles.pressed_button == HEAT) _last_heat_button_ms = millis();
+
     _handleSmartSchedulePanelOverride();
+
     cio->cio_toggles = dsp->dsp_toggles;
 
     play_sound();
@@ -229,14 +901,14 @@ void BWC::loop(){
         cio->cio_states.unit ? cio->cio_toggles.target = C2F(cio->cio_toggles.target) : cio->cio_toggles.target = F2C(cio->cio_toggles.target); 
     }
     
-    /*following method will change target temp and set _dsp_tgt_used to false if target temp is changed*/
+    
     _handleCommandQ();
     _handleSmartSchedule();
 
-    /*If new target was not set above, use whatever the cio says*/
+    
     cio->setRawPayload(dsp->getRawPayload());
     cio->setSerialReceived(dsp->getSerialReceived());
-    cio->handleToggles();               //transmits to cio if serial received from dsp
+    cio->handleToggles();               
 
     if(_save_settings_needed) saveSettings();
     if(_save_cmdq_needed) _saveCommandQueue();
@@ -244,8 +916,9 @@ void BWC::loop(){
     if(_save_smartschedule_needed) _saveSmartSchedule();
     _handleNotification();
     _handleStateChanges();
+    _enforcePostCloudStateRestore();
     _calcVirtualTemp();
-    // logstates();
+    
     if(BWC_DEBUG) _log();
 }
 
@@ -269,7 +942,7 @@ void BWC::_log()
     
     File file = LittleFS.open(F("log.txt"), "a");
     if (!file) {
-        // Serial.println(F("Failed to save states.txt"));
+        
         return;
     }
     if(++writes > 1000) 
@@ -343,10 +1016,12 @@ void BWC::play_sound()
             case UP:
                 if(dsp->EnabledButtons[UP]) _beep();
                 _dsp_tgt_used = true;
+                _last_target_button_ms = millis();
                 break;
             case DOWN:
                 if(dsp->EnabledButtons[DOWN]) _beep();
                 _dsp_tgt_used = true;
+                _last_target_button_ms = millis();
                 break;
             case TIMER:
                 if(dsp->EnabledButtons[TIMER]) _beep();
@@ -364,7 +1039,7 @@ void BWC::play_sound()
         dsp->dsp_toggles.pump_change    || dsp->dsp_toggles.unit_change
     ) 
         _accord();
-    /* Lock button sound is taken care of in _handleStateChanges() */
+    
 }
 
 void BWC::stop(){
@@ -404,7 +1079,7 @@ void BWC::pause_all(bool action)
         dsp->pause_all(action);
 }
 
-/*Sort by xtime, ascending*/
+
 bool BWC::_compare_command(const command_que_item& i1, const command_que_item& i2)
 {
     return i1.xtime < i2.xtime;
@@ -412,33 +1087,33 @@ bool BWC::_compare_command(const command_que_item& i1, const command_que_item& i
 
 void BWC::_handleNotification()
 {
-    /* user don't want a notification*/
+    
     if(!_notify) return;
-    /* there is no upcoming command*/
+    
     if(_command_que.size() == 0)
     {
         _next_notification_time = _notification_time;
         return;
     }
-    /* not the time yet*/
+    
     if((int64_t)_command_que[0].xtime - (int64_t)_timestamp_secs > (int64_t)_next_notification_time) return;
-    /* only _notify for these commands*/
+    
     if(!(_command_que[0].cmd == SETBUBBLES || _command_que[0].cmd == SETHEATER || _command_que[0].cmd == SETJETS || _command_que[0].cmd == SETPUMP)) return;
 
     if(_audio_enabled) _sweepup();
     dsp->text += "  --" + String(_next_notification_time) + "--";
-    // dsp->dsp_states.text = "i-i-";
+    
     if(_next_notification_time <= 2)
-        _next_notification_time = -10; //postpone "alarm" until after the command xtime (will be reset on command execution)
+        _next_notification_time = -10; 
     else
         _next_notification_time /= 2;
 }
 
 void BWC::_handleCommandQ() {
     if(_command_que.size() < 1) return;
-    /* time for next command? */
+    
     if (_timestamp_secs < _command_que[0].xtime) return;
-    //If interval > 0 then append to commandQ with updated xtime.
+    
     if(_command_que[0].interval > 0)
     {
         while(_command_que[0].xtime < (uint64_t)time(nullptr))
@@ -452,7 +1127,10 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
 {
     bool restartESP = false;
     
-    dsp->text += String(" ") + txt;
+    
+    
+    
+    if(txt.length() > 0) dsp->text += String(" ") + txt;
     switch (cmd)
     {
     case SETTARGET:
@@ -466,9 +1144,26 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
             cio->cio_toggles.target = round(F2C(val));
         else
             cio->cio_toggles.target = val;
-        /*Send this value to cio instead of results from button presses on the display*/
+
+        
+        
+        
+        
+        
+        if(_force_next_settarget && cio->cio_toggles.target == cio->cio_states.target)
+        {
+            if(cio->cio_states.unit)
+                cio->cio_states.target = (cio->cio_toggles.target > 20) ? (cio->cio_toggles.target - 1) : (cio->cio_toggles.target + 1);
+            else
+                cio->cio_states.target = (cio->cio_toggles.target > 68) ? (cio->cio_toggles.target - 1) : (cio->cio_toggles.target + 1);
+        }
+        _force_next_settarget = false;
+
+        
         _dsp_tgt_used = false;
         _web_target = cio->cio_toggles.target;
+        _last_target_cmd_ms = millis();
+        _last_target_cmd_val = (int8_t)cio->cio_toggles.target;
         break;
     }
     case SETUNIT:
@@ -478,27 +1173,131 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
         if((uint8_t)val != cio->cio_states.unit) cio->cio_toggles.unit_change = 1;
         _dsp_tgt_used = false;
         _web_target = cio->cio_toggles.target;
+        _last_target_cmd_ms = millis();
+        _last_target_cmd_val = (int8_t)cio->cio_toggles.target;
         break;
     case SETBUBBLES:
         if(val != cio->cio_states.bubbles) cio->cio_toggles.bubbles_change = 1;
         break;
     case SETHEATER:
-        if(val != cio->cio_states.heat) cio->cio_toggles.heat_change = 1;
+    {
+        const uint32_t now = millis();
+        _last_heat_cmd_ms = now;
+        _last_heat_cmd_val = (int8_t)val;
+
+        
+        
+        
+        if(val == 1)
+        {
+            
+            
+            
+            
+            _last_safe_pump = 1;
+            _last_safe_heat = 1;
+            _has_last_safe_states = true;
+            if(cio != nullptr)
+            {
+                _setLastSafeTargetFromCurrentUnit(_guardedTargetForSave());
+                _last_safe_god = cio->cio_states.godmode ? 1 : 0;
+            }
+            _savePersistentSafeStates();
+        }
+
+        
+        
+        
+        if(val == 0)
+        {
+            _last_safe_heat = 0;
+            _has_last_safe_states = true;
+            if(cio != nullptr)
+            {
+                _last_safe_pump = cio->cio_states.pump ? 1 : 0;
+                _setLastSafeTargetFromCurrentUnit(_guardedTargetForSave());
+                _last_safe_god = cio->cio_states.godmode ? 1 : 0;
+            }
+            _last_live_restore_ms = now;
+            _savePersistentSafeStates();
+            
+            
+            
+            
+_clearInternalRestoreCommands(false, true);
+        }
+
+        if(cio != nullptr && val != cio->cio_states.heat) cio->cio_toggles.heat_change = 1;
         break;
+    }
     case SETPUMP:
-        if(val != cio->cio_states.pump) cio->cio_toggles.pump_change = 1;
+    {
+        const uint32_t now = millis();
+        _last_pump_cmd_ms = now;
+        _last_pump_cmd_val = (int8_t)val;
+
+        
+        
+        
+        if(val == 1)
+        {
+            _pump_off_observe_since_ms = 0;
+            _last_safe_pump = 1;
+            _has_last_safe_states = true;
+            if(cio != nullptr)
+            {
+                _setLastSafeTargetFromCurrentUnit(_guardedTargetForSave());
+                _last_safe_god = cio->cio_states.godmode ? 1 : 0;
+            }
+            _savePersistentSafeStates();
+        }
+
+        
+        
+        
+        
+        if(val == 0)
+        {
+            _pump_off_observe_since_ms = 0;
+            _last_heat_cmd_ms = now;
+            _last_heat_cmd_val = 0;
+            _last_safe_pump = 0;
+            _last_safe_heat = 0;
+            _has_last_safe_states = true;
+            if(cio != nullptr)
+            {
+                _setLastSafeTargetFromCurrentUnit(_guardedTargetForSave());
+                _last_safe_god = cio->cio_states.godmode ? 1 : 0;
+            }
+            _last_live_restore_ms = now;
+            _savePersistentSafeStates();
+            
+            
+            
+            
+_clearInternalRestoreCommands(true, true);
+        }
+
+        if(cio != nullptr && val != cio->cio_states.pump) cio->cio_toggles.pump_change = 1;
         break;
+    }
     case RESETQ:
         _command_que.clear();
         _save_cmdq_needed = true;
-        _next_notification_time = _notification_time; //reset alarm time
+        _next_notification_time = _notification_time; 
         return false;
         break;
     case REBOOTESP:
         restartESP = true;
         break;
     case GETTARGET:
-        /*Not used atm*/
+        
+        
+        
+        
+        
+        _force_next_settarget = true;
+        _target_force_read_count++;
         break;
     case RESETTIMES:
         _uptime = 0;
@@ -567,13 +1366,13 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
         val = std::clamp((int)val, 0, 1);
         cio->cio_toggles.no_of_heater_elements_on = val+1;
         break;
-    /*PRINTTEXT is not a command per se. Every command prints the txt string, and if we ONLY want to print txt we do nothing to the command.*/
+    
     case SETREADY:
         {
             command_que_item item;
-            if((int64_t)_timestamp_secs > (int64_t)(val - _estHeatingTime() * 3600.0f - 7200)) //2 hours extra margin
+            if((int64_t)_timestamp_secs > (int64_t)(val - _estHeatingTime() * 3600.0f - 7200)) 
             {
-                /*time to start heating*/
+                
                 item.cmd = SETHEATER;
                 item.interval = 0;
                 item.text = "";
@@ -583,13 +1382,13 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
             }
             else
             {
-                /*Not time yet, so add check in one minute*/
+                
                 item.cmd = cmd;
                 item.interval = 0;
                 item.text = "";
                 item.val = val;
                 item.xtime = _timestamp_secs + 60;
-                /*We can't use addcommand() because it will copy xtime to val again*/
+                
                 _command_que.push_back(item);
                 std::sort(_command_que.begin(), _command_que.end(), _compare_command);
             }
@@ -600,12 +1399,36 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
         _vt_calibrated = true;
         _save_settings_needed = true;
         break;
+    case SETPOWER:
+        
+        
+        
+        
+        if(cio != nullptr && dsp != nullptr && dsp->EnabledButtons[POWER])
+        {
+            val = std::clamp((int)val, 0, 1);
+            if((uint8_t)val != cio->cio_states.power)
+                cio->cio_toggles.power_change = 1;
+        }
+        break;
+    case SETLOCK:
+        
+        
+        
+        
+        if(cio != nullptr && dsp != nullptr && dsp->EnabledButtons[LOCK] && cio->cio_states.power)
+        {
+            val = std::clamp((int)val, 0, 1);
+            if((uint8_t)val != cio->cio_states.locked)
+                cio->cio_toggles.lock_change = 1;
+        }
+        break;
     default:
         break;
     }
-    //remove from commandQ
+    
     _command_que.erase(_command_que.begin());
-    _next_notification_time = _notification_time; //reset alarm time
+    _next_notification_time = _notification_time; 
     _save_cmdq_needed = true;
     if(restartESP) {
         saveSettings();
@@ -614,7 +1437,7 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
         delay(3000);
         ESP.restart();
     }
-    /*If we pushed back an item, we need to re-sort the que*/
+    
     std::sort(_command_que.begin(), _command_que.end(), _compare_command);
     return false;
 }
@@ -622,6 +1445,16 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
 void BWC::_handleStateChanges()
 {
     if(_prev_cio_states != cio->cio_states || _prev_dsp_states.brightness != dsp->dsp_states.brightness) _new_data_available = true;
+
+    
+    
+    
+    
+    
+    if(cloudPollingGuardActive())
+    {
+        _cloud_poll_guard_state_skip_count++;
+    }
     if(cio->cio_states.temperature != _prev_cio_states.temperature)
     {
         _deltatemp = cio->cio_states.temperature - _prev_cio_states.temperature;
@@ -629,7 +1462,7 @@ void BWC::_handleStateChanges()
         _temp_change_timestamp_ms = millis();
     }
 
-    // Store virtual temp data point
+    
     if(cio->cio_states.heatred != _prev_cio_states.heatred)
     {
         _heatred_change_timestamp_ms = millis();
@@ -641,6 +1474,14 @@ void BWC::_handleStateChanges()
         _pump_change_timestamp_ms = millis();
     }
 
+    if(dsp->dsp_toggles.pressed_button == PUMP) _last_pump_button_ms = millis();
+    if(dsp->dsp_toggles.pressed_button == HEAT) _last_heat_button_ms = millis();
+
+    
+    
+    _enforceSafeLiveState("state change");
+    _enforceSafeTargetState("state change");
+
     if(cio->cio_states.bubbles != _prev_cio_states.bubbles)
     {
         _bubbles_change_timestamp_ms = millis();
@@ -649,6 +1490,21 @@ void BWC::_handleStateChanges()
     if((cio->cio_states.locked != _prev_cio_states.locked) && dsp->EnabledButtons[LOCK] && _audio_enabled && (dsp->dsp_toggles.pressed_button == LOCK))
     {
         _beep();
+    }
+
+    if(cio->cio_states.target != _prev_cio_states.target)
+    {
+        
+        
+        
+        
+        if(!_targetLooksSuspicious(cio->cio_states.target))
+        {
+            _web_target = cio->cio_states.target;
+            _setLastSafeTargetFromCurrentUnit(cio->cio_states.target);
+            _has_last_safe_states = true;
+            _target_suspicious_since_ms = 0;
+        }
     }
 
     if(
@@ -671,53 +1527,53 @@ void BWC::_handleStateChanges()
     _prev_cio_states = cio->cio_states;
     _prev_dsp_states = dsp->dsp_states;
     _prevbutton = _currbutton;
-    /* check changes from DSP 4W - go to antigodmode if someone presses a button*/
+    
 }
 
-// return how many hours until pool is ready. (provided the heater is on)
+
 float BWC::_estHeatingTime()
 {
     int targetInC = cio->cio_states.target;
     if(!cio->cio_states.unit) targetInC = F2C(targetInC);
-    if(_virtual_temp > targetInC) return -2;  //Already
+    if(_virtual_temp > targetInC) return -2;  
 
-    // float degAboveAmbient = _virtual_temp - (float)_ambient_temp;
-    // float fraction = 1.0f - (degAboveAmbient - floor(degAboveAmbient));
-    // int deltaTemp = targetInC - _virtual_temp;
+    
+    
+    
 
-    // //integrate the time needed to reach target
-    // //how long to next integer temp
-    // double coolingPerHour = degAboveAmbient / _R_COOLING;
-    // double netRisePerHour;
-    // netRisePerHour = _heating_degperhour - coolingPerHour;
+    
+    
+    
+    
+    
 
-    // double hoursRemaining = fraction / netRisePerHour;
+    
 
     double degAboveAmbient;
     double deltaTemp = targetInC - _virtual_temp;
     double coolingPerHour;
     double netRisePerHour;
     double hoursRemaining = 0;
-    //iterate up to target
+    
     for(float i = 0; i <= deltaTemp; i += 0.01)
     {
         degAboveAmbient = _virtual_temp + i - _ambient_temp;
         coolingPerHour = degAboveAmbient / _R_COOLING;
         netRisePerHour = _heating_degperhour - coolingPerHour;
-        if(netRisePerHour <= 0) return -1; //Never
+        if(netRisePerHour <= 0) return -1; 
         hoursRemaining += 0.01 / netRisePerHour;
     }
 
     if(hoursRemaining >= 0)
         return hoursRemaining;
     else 
-        return -1; //Never
+        return -1; 
 }
 
-//virtual temp is always C in this code and will be converted when sending externally
+
 void BWC::_calcVirtualTemp()
 {
-    //startup init
+    
     if(millis() < 30000)
     {
         int tempInC = cio->cio_states.temperature;
@@ -730,7 +1586,7 @@ void BWC::_calcVirtualTemp()
         return;
     }
 
-    // calculate from last updated VTFix.
+    
     double netRisePerHour;
     float degAboveAmbient = _virtual_temp - _ambient_temp;
     double coolingPerHour = degAboveAmbient / _R_COOLING;
@@ -746,7 +1602,7 @@ void BWC::_calcVirtualTemp()
     double elapsed_hours = _virtual_temp_fix_age / 3600.0 / 1000.0;
     float newvt = _virtual_temp_fix + netRisePerHour * elapsed_hours;
 
-    // clamp VT to +/- 1 from measured temperature if pump is running
+    
     if(cio->cio_states.pump && ((millis()-_pump_change_timestamp_ms) > 5*60000))
     {
         float tempInC = cio->cio_states.temperature;
@@ -762,7 +1618,7 @@ void BWC::_calcVirtualTemp()
         newvt = tempInC + dev;
     }
 
-    // Rebase start of calculation from new integer temperature
+    
     if(int(_virtual_temp) != int(newvt))
     {
         _virtual_temp_fix = newvt;
@@ -770,21 +1626,12 @@ void BWC::_calcVirtualTemp()
     }
     _virtual_temp = newvt;
 
-    /* Using Newtons law of cooling
-        T(t) = Tenv + (T(0) - Tenv)*e^(-t/r)
-        r = -t / ln( (T(t)-Tenv) / (T(0)-Tenv) )
-        dT/dt = (T(t) - Tenv) / r
-        ----------------------------------------
-        T(t) : Temperature at time t
-        Tenv : _ambient_temp (considered constant)
-        T(0) : Temperature at time 0 (_virtual_temp_fix)
-        e    : natural number 2,71828182845904
-        r    : a constant we need to find out by measurements
-    */
+    
+
 
 }
 
-//Called on temp change
+
 void BWC::_updateVirtualTempFix_ontempchange()
 {
     int tempInC = cio->cio_states.temperature;
@@ -793,39 +1640,36 @@ void BWC::_updateVirtualTempFix_ontempchange()
         tempInC = F2C(tempInC);
         conversion = 1/1.8;
     }
-    //Do not process if temperature changed > 1 degree (reading spikes)
+    
     if(abs(_deltatemp) != 1) return;
 
-    //readings are only valid if pump is running and has been running for 5 min.
+    
     if(!cio->cio_states.pump || ((millis()-_pump_change_timestamp_ms) < 5*60000)) return;
 
     _virtual_temp = tempInC;
     _virtual_temp_fix = tempInC;
     _virtual_temp_fix_age = 0;
-    /*
-    update_coolingDegPerHourArray
-    Measured temp has changed by 1 degree over a certain time
-    1 degree/(temperature age in ms / 3600 / 1000)hours = 3 600 000 / temperature age in ms
-    */
+    
 
-    // We can only know something about rate of change if we had continous cooling since last update
-    // (Nobody messed with the heater during the 1 degree change)
-    if(_heatred_change_timestamp_ms > _temp_change_timestamp_ms) return; //bugfix by @cobaltfish
-    // rate of heating is not subject to change (fixed wattage and pool size) so do this only if cooling
-    // and do not calibrate if bubbles has been on
+
+    
+    
+    if(_heatred_change_timestamp_ms > _temp_change_timestamp_ms) return; 
+    
+    
     if(_vt_calibrated) return;
     if(cio->cio_states.heatred || cio->cio_states.bubbles || (_bubbles_change_timestamp_ms > _temp_change_timestamp_ms)) return;
-    if(_deltatemp > 0 && _virtual_temp > _ambient_temp) return; //temp is rising when it should be falling. Bail out
-    if(_deltatemp < 0 && _virtual_temp < _ambient_temp) return; //temp is falling when it should be rising. Bail out
+    if(_deltatemp > 0 && _virtual_temp > _ambient_temp) return; 
+    if(_deltatemp < 0 && _virtual_temp < _ambient_temp) return; 
     float degAboveAmbient = _virtual_temp - _ambient_temp;
-    // can't calibrate if ambient ~ virtualtemp
+    
     if(abs(degAboveAmbient) <= 1) return;
     _R_COOLING = ((millis()-_temp_change_timestamp_ms)/3600000.0) / log((conversion*degAboveAmbient) / (conversion*(degAboveAmbient + _deltatemp)));
     _vt_calibrated = true;
     _save_settings_needed = true;
 }
 
-//Called on heater state change
+
 void BWC::_updateVirtualTempFix_onheaterchange()
 {
     _virtual_temp_fix = _virtual_temp;
@@ -837,20 +1681,6 @@ void BWC::print(const String &txt)
     dsp->text += txt;
 }
 
-// String BWC::getDebugData()
-// {
-//     String res = "from cio ";
-//     res += cio->cio_states.toString();
-//     res += "to dsp ";
-//     res += dsp->dsp_states.toString();
-//     res += "from dsp ";
-//     res += dsp->dsp_toggles.toString();
-//     res += "to cio ";
-//     res += cio->cio_toggles.toString();
-//     res += "BtnQLen: ";
-//     res += cio->_button_que_len;
-//     return res;
-// }
 
 void BWC::setAmbientTemperature(int64_t amb, bool unit)
 {
@@ -869,19 +1699,19 @@ String BWC::getModel()
 bool BWC::add_command(command_que_item command_item)
 {
     _save_cmdq_needed = true;
-    /* TODO: handle resetq in handlecommandque() instead!!! */
-    // if(command_item.cmd == RESETQ)
-    // {
-    //     _command_que.clear();
-    //     return true;
-    // }
+    
+    
+    
+    
+    
+    
     if(command_item.cmd == SETREADY)
     {
-        command_item.val = (int64_t)command_item.xtime; //Use val field to store the time to be ready
-        command_item.xtime = 0; //And start checking now
+        command_item.val = (int64_t)command_item.xtime; 
+        command_item.xtime = 0; 
         command_item.interval = 0;
     }
-    //add parameters to _command_que[rows][parameter columns] and sort the array on xtime.
+    
     _command_que.push_back(command_item);
     std::sort(_command_que.begin(), _command_que.end(), _compare_command);
     return true;
@@ -889,21 +1719,23 @@ bool BWC::add_command(command_que_item command_item)
 
 bool BWC::edit_command(uint8_t index, command_que_item command_item)
 {
-    if(index > _command_que.size()) return false;
+    
+    
+    if(index >= _command_que.size()) return false;
     _save_cmdq_needed = true;
-    /* TODO: handle resetq in handlecommandque() instead!!! */
-    // if(command_item.cmd == RESETQ)
-    // {
-    //     _command_que.clear();
-    //     return true;
-    // }
+    
+    
+    
+    
+    
+    
     if(command_item.cmd == SETREADY)
     {
-        command_item.val = (int64_t)command_item.xtime; //Use val field to store the time to be ready
-        command_item.xtime = 0; //And start checking now
+        command_item.val = (int64_t)command_item.xtime; 
+        command_item.xtime = 0; 
         command_item.interval = 0;
     }
-    //add parameters to _command_que[index] and sort the array on xtime.
+    
     _command_que.at(index) = command_item;
     std::sort(_command_que.begin(), _command_que.end(), _compare_command);
     return true;
@@ -917,7 +1749,7 @@ bool BWC::del_command(uint8_t index)
     return true;
 }
 
-//check for special button sequence
+
 bool BWC::getBtnSeqMatch()
 {
     if( _btn_sequence[0] == POWER &&
@@ -931,16 +1763,16 @@ bool BWC::getBtnSeqMatch()
 }
 
 void BWC::getJSONStates(String &rtn) {
-        // Allocate a temporary JsonDocument
-        // Don't forget to change the capacity to match your requirements.
-        // Use arduinojson.org/assistant to compute the capacity.
-    //feed the dog
+        
+        
+        
+    
     #ifdef ESP8266
     ESP.wdtFeed();
     #endif
     DynamicJsonDocument doc(1536);
 
-    // Set the values in the document
+    
     doc[F("CONTENT")] = F("STATES");
     doc[F("TIME")] = _timestamp_secs;
     doc[F("LCK")] = cio->cio_states.locked;
@@ -957,7 +1789,13 @@ void BWC::getJSONStates(String &rtn) {
     doc[F("BRT")] = dsp->dsp_states.brightness;
     doc[F("ERR")] = cio->cio_states.error;
     doc[F("GOD")] = (uint8_t)cio->cio_states.godmode;
-    doc[F("TGT")] = cio->cio_states.target;
+    
+    
+    const uint8_t actualTargetForJson = cio->cio_states.target;
+    const uint8_t guardedTargetForJson = _guardedTargetForSave();
+    doc[F("TGT")] = actualTargetForJson;
+    doc[F("TGTRAW")] = actualTargetForJson;
+    doc[F("TGTG")] = guardedTargetForJson;
     doc[F("TMP")] = cio->cio_states.temperature;
     doc[F("VTMC")] = _virtual_temp;
     doc[F("VTMF")] = C2F(_virtual_temp);
@@ -965,45 +1803,44 @@ void BWC::getJSONStates(String &rtn) {
     doc[F("AMBF")] = round(C2F(_ambient_temp));
     if(cio->cio_states.unit)
     {
-        //celsius
+        
         doc[F("AMB")] = _ambient_temp;
-    doc[F("POOLCAP")] = _pool_capacity;
         doc[F("VTM")] = _virtual_temp;
-        doc[F("TGTC")] = cio->cio_states.target;
+        doc[F("TGTC")] = actualTargetForJson;
         doc[F("TMPC")] = cio->cio_states.temperature;
-        doc[F("TGTF")] = round(C2F((float)cio->cio_states.target));
+        doc[F("TGTF")] = round(C2F((float)actualTargetForJson));
         doc[F("TMPF")] = round(C2F((float)cio->cio_states.temperature));
-        // doc[F("VTMF")] = C2F(_virtual_temp);
+        
     }
     else
     {
-        //farenheit
+        
         doc[F("AMB")] = round(C2F(_ambient_temp));
         doc[F("VTM")] = C2F(_virtual_temp);
-        doc[F("TGTF")] = cio->cio_states.target;
+        doc[F("TGTF")] = actualTargetForJson;
         doc[F("TMPF")] = cio->cio_states.temperature;
-        doc[F("TGTC")] = round(F2C((float)cio->cio_states.target));
+        doc[F("TGTC")] = round(F2C((float)actualTargetForJson));
         doc[F("TMPC")] = round(F2C((float)cio->cio_states.temperature));
-        // doc[F("VTMC")] = _virtual_temp;
+        
     }
 
-    // Serialize JSON to string
+    
     if (serializeJson(doc, rtn) == 0) {
         rtn = F("{\"error\": \"Failed to serialize states\"}");
     }
 }
 
 void BWC::getJSONTimes(String &rtn) {
-    // Allocate a temporary JsonDocument
-    // Don't forget to change the capacity to match your requirements.
-    // Use arduinojson.org/assistant to compute the capacity.
-    //feed the dog
+    
+    
+    
+    
     #ifdef ESP8266
     ESP.wdtFeed();
     #endif
     DynamicJsonDocument doc(1024);
 
-    // Set the values in the document
+    
     doc[F("CONTENT")] = F("TIMES");
     doc[F("TIME")] = _timestamp_secs;
     doc[F("CLTIME")] = _cl_timestamp_s;
@@ -1021,7 +1858,7 @@ void BWC::getJSONTimes(String &rtn) {
     doc[F("FCLEI")] = _filter_clean_interval;
     doc[F("CLINT")] = _cl_interval;
     doc[F("KWH")] = _energy_total_kWh;
-    doc[F("KWHD")] = _energy_daily_Ws / 3600000.0; //Ws -> kWh
+    doc[F("KWHD")] = _energy_daily_Ws / 3600000.0; 
     doc[F("WATT")] = _energy_power_W;
     float t2r = _estHeatingTime();
     String t2r_string = F("Nicht bereit");
@@ -1035,25 +1872,25 @@ void BWC::getJSONTimes(String &rtn) {
     s += F(" || ");
     s += dsp->debug();
     doc[F("DBG")] = s;
-    //cio->clk_per = 1000;  //reset minimum clock period
+    
 
-    // Serialize JSON to string
+    
     if (serializeJson(doc, rtn) == 0) {
         rtn = F("{\"error\": \"Failed to serialize times\"}");
     }
 }
 
 void BWC::getJSONSettings(String &rtn){
-    // Allocate a temporary JsonDocument
-    // Don't forget to change the capacity to match your requirements.
-    // Use arduinojson.org/assistant to compute the capacity.
-    //feed the dog
+    
+    
+    
+    
     #ifdef ESP8266
     ESP.wdtFeed();
     #endif
     DynamicJsonDocument doc(1024);
 
-    // Set the values in the document
+    
     doc[F("CONTENT")] = F("SETTINGS");
     doc[F("PRICE")] = _price;
     doc[F("FREPI")] = _filter_replace_interval;
@@ -1083,19 +1920,19 @@ void BWC::getJSONSettings(String &rtn){
     doc[F("PWR")] = dsp->EnabledButtons[POWER];
     doc[F("HJT")] = dsp->EnabledButtons[HYDROJETS];
 
-    // Serialize JSON to string
+    
     if (serializeJson(doc, rtn) == 0) {
         rtn = F("{\"error\": \"Failed to serialize settings\"}");
     }
 }
 
 String BWC::getJSONCommandQueue(){
-    //feed the dog
+    
     #ifdef ESP8266
     ESP.wdtFeed();
     #endif
     DynamicJsonDocument doc(1024);
-    // Set the values in the document
+    
     doc[F("LEN")] = _command_que.size();
     for(unsigned int i = 0; i < _command_que.size(); i++){
         doc[F("CMD")][i] = _command_que[i].cmd;
@@ -1105,7 +1942,7 @@ String BWC::getJSONCommandQueue(){
         doc[F("TXT")][i] = _command_que[i].text;
     }
 
-    // Serialize JSON to file
+    
     String jsonmsg;
     if (serializeJson(doc, jsonmsg) == 0) {
         jsonmsg = F("{\"error\": \"Failed to serialize cmdq\"}");
@@ -1113,9 +1950,9 @@ String BWC::getJSONCommandQueue(){
     return jsonmsg;
 }
 
-/*TODO:*/
+
 uint8_t BWC::getState(int state){
-    // return cio->getState(state);
+    
     return 0;
 }
 
@@ -1129,18 +1966,18 @@ Buttons BWC::getButton()
 }
 
 void BWC::setJSONSettings(const String& message){
-    //feed the dog
-    // ESP.wdtFeed();
+    
+    
     DynamicJsonDocument doc(1024);
 
-    // Deserialize the JSON document
+    
     DeserializationError error = deserializeJson(doc, message);
     if (error) {
-        // Serial.println(F("Failed to read config file"));
+        
         return;
     }
 
-    // Copy existing values from the JsonDocument to the variables
+    
     _price = doc[F("PRICE")] | _price;
     _filter_replace_interval = doc[F("FREPI")] | _filter_replace_interval;
     _filter_rinse_interval = doc[F("FRINI")] | _filter_rinse_interval;
@@ -1150,6 +1987,11 @@ void BWC::setJSONSettings(const String& message){
     _restore_states_on_start = doc[F("RESTORE")] | _restore_states_on_start;
     _notify = doc[F("NOTIFY")] | _notify;
     _notification_time = doc[F("NOTIFTIME")] | _notification_time;
+    if(_notification_time < 1 || _notification_time > 1000)
+    {
+        _notification_time = 32;
+    }
+    _next_notification_time = _notification_time;
     _vt_calibrated = doc[F("VTCAL")] | _vt_calibrated;
     if(doc.containsKey(F("POOLCAP"))) { int v = doc[F("POOLCAP")]; if(v >= 100 && v <= 3000) _pool_capacity = v; }
     dsp->EnabledButtons[LOCK] = doc[F("LCK")] | dsp->EnabledButtons[LOCK];
@@ -1176,14 +2018,14 @@ void BWC::_updateTimes(){
     static uint32_t prevtime = now;
     int elapsedtime_ms = now-prevtime;
     prevtime = now;
-    // //(some of) these age-counters resets when the state changes
-    // for(unsigned int i = 0; i < cio->getSizeofStates(); i++)
-    // {
-    //     cio->setStateAge(i, cio->getStateAge(i) + elapsedtime_ms);
-    // }
+    
+    
+    
+    
+    
     _virtual_temp_fix_age += elapsedtime_ms;
 
-    if (elapsedtime_ms < 0) return; //millis() rollover every 24,8 days
+    if (elapsedtime_ms < 0) return; 
     if(cio->cio_states.heatred){
         _heatingtime_ms += elapsedtime_ms;
     }
@@ -1212,15 +2054,15 @@ void BWC::_updateTimes(){
         _uptime_ms = 0;
     }
 
-    if(_override_dsp_brt_timer > 0) _override_dsp_brt_timer -= elapsedtime_ms; //counts down to or below zero
+    if(_override_dsp_brt_timer > 0) _override_dsp_brt_timer -= elapsedtime_ms; 
 
-    // watts, kWh today, total kWh
+    
     float heatingEnergy = (_heatingtime+_heatingtime_ms/1000)/3600.0 * cio->getHeaterPower();
     float pumpEnergy = (_pumptime+_pumptime_ms/1000)/3600.0 * cio->getPowerLevels().PUMPPOWER;
     float airEnergy = (_airtime+_airtime_ms/1000)/3600.0 * cio->getPowerLevels().AIRPOWER;
     float idleEnergy = (_uptime+_uptime_ms/1000)/3600.0 * cio->getPowerLevels().IDLEPOWER;
     float jetEnergy = (_jettime+_jettime_ms/1000)/3600.0 * cio->getPowerLevels().JETPOWER;
-    _energy_total_kWh = (heatingEnergy + pumpEnergy + airEnergy + idleEnergy + jetEnergy)/1000; //Wh -> kWh
+    _energy_total_kWh = (heatingEnergy + pumpEnergy + airEnergy + idleEnergy + jetEnergy)/1000; 
     _energy_power_W = cio->cio_states.heatred * cio->getHeaterPower();
     _energy_power_W += cio->cio_states.pump * cio->getPowerLevels().PUMPPOWER;
     _energy_power_W += cio->cio_states.bubbles * cio->getPowerLevels().AIRPOWER;
@@ -1228,7 +2070,7 @@ void BWC::_updateTimes(){
     _energy_power_W += cio->cio_states.jets * cio->getPowerLevels().JETPOWER;
 
     _energy_daily_Ws += elapsedtime_ms * _energy_power_W / 1000.0;
-    _energy_cost += _price * _energy_power_W / (1000.0 * 1000.0 * 3600.0); // money/kWh
+    _energy_cost += _price * _energy_power_W / (1000.0 * 1000.0 * 3600.0); 
 
     if(_notes.size())
     {
@@ -1247,23 +2089,20 @@ void BWC::_updateTimes(){
     }
 }
 
-/*          */
-/* LOADERS  */
-/*          */
 
 bool BWC::_loadHardware(Models& cioNo, Models& dspNo, int pins[], std::optional<Power>& power_levels)
 {
     File file = LittleFS.open(F("/hwcfg.json"), "r");
     if (!file)
     {
-        // Serial.println(F("Failed to open hwcfg.json"));
+        
         return false;
     }
-    // DynamicJsonDocument doc(256);
+    
     StaticJsonDocument<512> doc;
     DeserializationError error = deserializeJson(doc, file);
     if (error) {
-        // Serial.println(F("Failed to read settings.txt"));
+        
         file.close();
         return false;
     }
@@ -1277,7 +2116,7 @@ bool BWC::_loadHardware(Models& cioNo, Models& dspNo, int pins[], std::optional<
     }
 
     String pcbname = doc[F("pcb")].as<String>();
-    // int pins[7];
+    
     #ifdef ESP8266
     int DtoGPIO[] = {D0, D1, D2, D3, D4, D5, D6, D7, D8};
     #endif
@@ -1314,20 +2153,20 @@ void BWC::reloadSettings(){
 void BWC::_loadSettings(){
     File file = LittleFS.open(F("/settings.json"), "r");
     if (!file) {
-        // Serial.println(F("Failed to load settings.json"));
+        
         return;
     }
     DynamicJsonDocument doc(1024);
 
-    // Deserialize the JSON document
+    
     DeserializationError error = deserializeJson(doc, file);
     if (error) {
-        // Serial.println(F("Failed to deser. settings.json"));
+        
         file.close();
         return;
     }
 
-    // Copy values from the JsonDocument to the variables
+    
     _cl_timestamp_s = doc[F("CLTIME")];
     _filter_replace_timestamp_s = doc[F("FREP")];
     _filter_rinse_timestamp_s = doc[F("FRIN")];
@@ -1344,12 +2183,17 @@ void BWC::_loadSettings(){
     _cl_interval = doc[F("CLINT")];
     _audio_enabled = doc[F("AUDIO")];
     _notify = doc[F("NOTIFY")];
-    _notification_time = doc[F("NOTIFTIME")];
+    _notification_time = doc[F("NOTIFTIME")] | _notification_time;
+    if(_notification_time < 1 || _notification_time > 1000)
+    {
+        _notification_time = 32;
+    }
+    _next_notification_time = _notification_time;
     _energy_total_kWh = doc[F("KWH")];
     _energy_daily_Ws = doc[F("KWHD")];
     _energy_cost = doc[F("COST")];
     _restore_states_on_start = doc[F("RESTORE")];
-    _R_COOLING = doc[F("R")] | 40.0f; //else use default
+    _R_COOLING = doc[F("R")] | 40.0f; 
     _ambient_temp = doc[F("AMB")] | 20;
     _dsp_brightness = doc[F("BRT")] | 7;
     _vt_calibrated = doc[F("VTCAL")] | false;
@@ -1374,15 +2218,15 @@ void BWC::_restoreStates() {
     if(!_restore_states_on_start) return;
     File file = LittleFS.open(F("states.txt"), "r");
     if (!file) {
-        // Serial.println(F("Failed to read states.txt"));
+        
         return;
     }
-    // DynamicJsonDocument doc(512);
+    
     StaticJsonDocument<512> doc;
-    // Deserialize the JSON document
+    
     DeserializationError error = deserializeJson(doc, file);
     if (error) {
-        // Serial.println(F("Failed to deserialize states.txt"));
+        
         file.close();
         return;
     }
@@ -1392,6 +2236,24 @@ void BWC::_restoreStates() {
     uint8_t htr = doc[F("HTR")];
     uint8_t tgt = doc[F("TGT")] | 20;
     uint8_t god = doc[F("GOD")] ;
+
+    
+    
+    if(_has_last_safe_states)
+    {
+        flt = _last_safe_pump;
+        htr = _last_safe_heat;
+        const uint8_t safeTgtForRestoreUnit = _convertTargetToUnit(_last_safe_target, _last_safe_unit, unt ? 1 : 0);
+
+        
+        
+        
+        
+        
+        tgt = safeTgtForRestoreUnit;
+        god = _last_safe_god;
+    }
+
     command_que_item item;
     item.cmd = SETGODMODE;
     item.val = god;
@@ -1417,13 +2279,23 @@ void BWC::_restoreStates() {
     item.interval = 0;
     item.text = "";
     add_command(item);
+    
+    
+    
+    item.cmd = GETTARGET;
+    item.val = 0;
+    item.xtime = 0;
+    item.interval = 0;
+    item.text = "";
+    add_command(item);
+
     item.cmd = SETTARGET;
     item.val = tgt;
     item.xtime = 0;
     item.interval = 0;
     item.text = "";
     add_command(item);
-    // Serial.println(F("Restoring states"));
+    
     file.close();
 }
 
@@ -1434,20 +2306,20 @@ void BWC::reloadCommandQueue(){
 void BWC::loadCommandQueue(){
     File file = LittleFS.open(F("/cmdq.json"), "r");
     if (!file) {
-        // Serial.println(F("Failed to read cmdq.json"));
+        
         return;
     }
 
     DynamicJsonDocument doc(1024);
-    // Deserialize the JSON document
+    
     DeserializationError error = deserializeJson(doc, file);
     if (error) {
-        // Serial.println(F("Failed to deserialize cmdq.json"));
+        
         file.close();
         return;
     }
     _command_que.clear();
-    // Set the values in the variables
+    
     for(int i = 0; i < doc[F("LEN")]; i++){
         command_que_item item;
         item.cmd = doc[F("CMD")][i];
@@ -1463,87 +2335,94 @@ void BWC::loadCommandQueue(){
     std::sort(_command_que.begin(), _command_que.end(), _compare_command);
 }
 
-/*          */
-/* SAVERS   */
-/*          */
 
 void BWC::saveRebootInfo(){
     File file = LittleFS.open(F("bootlog.txt"), "a");
     if (!file) {
-        // Serial.println(F("Failed to save bootlog.txt"));
+        
         return;
     }
 
-    // DynamicJsonDocument doc(1024);
+    
     StaticJsonDocument<256> doc;
 
-    // Set the values in the document
+    
     #ifdef ESP8266
     doc[F("BOOTINFO")] = ESP.getResetReason() + " " + reboot_time_str;
     #endif
 
-    // Serialize JSON to file
+    
     if (serializeJson(doc, file) == 0) {
-        // Serial.println(F("Failed to write bootlog.txt"));
+        
     }
     file.println();
     file.close();
 }
 
 void BWC::_saveStates() {
-    // //kill the dog
-    // // ESP.wdtDisable();
     #ifdef ESP8266
     ESP.wdtFeed();
     #endif
     _save_states_needed = false;
-    File file = LittleFS.open(F("states.txt"), "w");
-    if (!file) {
-        // Serial.println(F("Failed to save states.txt"));
+
+    if(cloudPollingGuardActive())
+    {
+        _cloud_poll_guard_save_skip_count++;
+        _state_guard_skip_count++;
         return;
     }
 
-    // DynamicJsonDocument doc(1024);
+    if(_shouldBlockUnsafeStateSave())
+    {
+        _state_guard_skip_count++;
+        _enforceSafeLiveState("blocked unsafe save");
+        _enforceSafeTargetState("blocked unsafe save");
+        return;
+    }
+
+    _enforceSafeTargetState("save states");
+
+    File file = LittleFS.open(F("states.txt"), "w");
+    if (!file) {
+        return;
+    }
+
     StaticJsonDocument<256> doc;
 
-    // Set the values in the document
     doc[F("UNT")] = cio->cio_states.unit;
     doc[F("HTR")] = cio->cio_states.heat;
     doc[F("FLT")] = cio->cio_states.pump;
-    doc[F("TGT")] = cio->cio_states.target;
-    doc[F("GOD")] = (uint8_t)cio->cio_states.godmode;  //makes the file look better
+    doc[F("TGT")] = _guardedTargetForSave();
+    doc[F("GOD")] = (uint8_t)cio->cio_states.godmode;
 
-    // Serialize JSON to file
-    if (serializeJson(doc, file) == 0) {
-        // Serial.println(F("Failed to write states.txt"));
-    }
+    serializeJson(doc, file);
     file.close();
-    // //revive the dog
-    // // ESP.wdtEnable(0);
+
+    _updateLastKnownSafeStates();
 }
 
 void BWC::_saveCommandQueue()
 {
-    // --- 1) Rate-Limit / Debounce: max 1x alle 3000 ms schreiben ---
+    
     const uint32_t now = millis();
     const uint32_t MIN_SAVE_GAP_MS = 3000;
 
     if ((uint32_t)(now - g_cmdq_last_save_ms) < MIN_SAVE_GAP_MS) {
-        // Noch zu früh -> später nochmal versuchen, Flag bleibt true
+        
         return;
     }
 
-    // --- 2) "Nicht speichern" Sonderfall: Instant-Reboot ganz vorne ---
-    // WICHTIG: Das muss VOR dem File-open passieren!
+    
+    
     if (_command_que.size() &&
         _command_que[0].cmd == REBOOTESP &&
         _command_que[0].interval == 0)
     {
-        _save_cmdq_needed = false; // damit er nicht jede Loop wieder versucht
+        _save_cmdq_needed = false; 
         return;
     }
 
-    // --- 3) JSON bauen und Hash vergleichen (nur schreiben, wenn geändert) ---
+    
     DynamicJsonDocument doc(1024);
     doc[F("LEN")] = _command_que.size();
 
@@ -1558,19 +2437,19 @@ void BWC::_saveCommandQueue()
     String json;
     json.reserve(768);
     if (serializeJson(doc, json) == 0) {
-        // konnte nicht serialisieren -> später erneut versuchen
+        
         return;
     }
 
     const uint32_t h = fnv1a32((const uint8_t*)json.c_str(), json.length());
     if (h == g_cmdq_last_hash) {
-        // Inhalt identisch -> kein Flash-Write nötig
+        
         _save_cmdq_needed = false;
-        g_cmdq_last_save_ms = now; // trotzdem "beruhigen"
+        g_cmdq_last_save_ms = now; 
         return;
     }
 
-    // --- 4) Jetzt erst File schreiben ---
+    
     File file = LittleFS.open(F("/cmdq.json"), "w");
     if (!file) {
         Serial.println(F("Failed to save cmdq.json"));
@@ -1583,14 +2462,14 @@ void BWC::_saveCommandQueue()
     file.close();
 
     if (written == 0) {
-        // Schreiben fehlgeschlagen -> später erneut versuchen
+        
         Serial.println(F("cmdq.json write FAILED"));
         return;
     }
 
     Serial.println(F("Done!"));
 
-    // --- 5) Erfolg: Flags/Tracker updaten ---
+    
     g_cmdq_last_hash = h;
     g_cmdq_last_save_ms = now;
     _save_cmdq_needed = false;
@@ -1598,15 +2477,15 @@ void BWC::_saveCommandQueue()
 
 
 void BWC::saveSettings(){
-    //kill the dog
-    // ESP.wdtDisable();
+    
+    
     #ifdef ESP8266
     ESP.wdtFeed();
     #endif
     _save_settings_needed = false;
     File file = LittleFS.open(F("settings.json"), "w");
     if (!file) {
-        // Serial.println(F("Failed to save settings.json"));
+        
         return;
     }
 
@@ -1621,7 +2500,7 @@ void BWC::saveSettings(){
     _airtime_ms = 0;
     _jettime_ms = 0;
     _uptime_ms = 0;
-    // Set the values in the document
+    
     doc[F("CLTIME")] = _cl_timestamp_s;
     doc[F("FREP")] = _filter_replace_timestamp_s;
     doc[F("FRIN")] = _filter_rinse_timestamp_s;
@@ -1640,10 +2519,11 @@ void BWC::saveSettings(){
     doc[F("KWH")] = _energy_total_kWh;
     doc[F("KWHD")] = _energy_daily_Ws;
     doc[F("COST")] = _energy_cost;
-    // doc[F("SAVETIME")] = DateTime.format(DateFormatter::SIMPLE);
+    
     doc[F("RESTORE")] = _restore_states_on_start;
     doc[F("R")] = _R_COOLING;
     doc[F("AMB")] = _ambient_temp;
+    doc[F("POOLCAP")] = _pool_capacity;
     doc[F("BRT")] = _dsp_brightness;
     doc[F("NOTIFY")] = _notify;
     doc[F("NOTIFTIME")] = _notification_time;
@@ -1659,71 +2539,54 @@ void BWC::saveSettings(){
     doc[F("PWR")] = dsp->EnabledButtons[POWER];
     doc[F("HJT")] = dsp->EnabledButtons[HYDROJETS];
 
-    // Serialize JSON to file
+    
     if (serializeJson(doc, file) == 0) {
-        // Serial.println(F("Failed to write json to settings.json"));
+        
     }
     file.close();
-    //revive the dog
-    // ESP.wdtEnable(0);
+    
+    
 }
 
-//save out debug text to file "debug.txt" on littleFS
+
 void BWC::saveDebugInfo(const String& s){
     File file = LittleFS.open(F("debug.txt"), "a");
     if (!file) {
-        // Serial.println(F("Failed to save debug.txt"));
+        
         return;
     }
 
     DynamicJsonDocument doc(1024);
 
-    // Set the values in the document
+    
     doc[F("timestamp")] = time(nullptr);
     doc[F("message")] = s;
-    // Serialize JSON to file
+    
     if (serializeJson(doc, file) == 0) {
-        // Serial.println(F("Failed to write debug.txt"));
+        
     }
     file.close();
 }
 
-/* SOUND */
-
-/*temporary function to render some soundfiles*/
-// void BWC::_save_melody(const String& filename)
-// {
-//     File file = LittleFS.open(filename, "w");
-//     if (!file) return;
-//     sNote n = {1000, 500};
-//     file.write((byte*)&n, sizeof(n));
-//     file.close();
-// }
 
 bool BWC::_load_melody_json(const String& filename)
 {
     if(_notes.size() || !_audio_enabled){
-        // Serial.println("Q busy");
+        
         return false;
     } 
     File file = LittleFS.open(filename, "r");
     if (!file){
-        // Serial.println("file error");
+        
         return false; 
     } 
     int beat_period;
     float note_duty_cycle;
     sNote n;
 
-    /*new file format: 
-    beat period
-    note duty cycle
-    frequency
-    duration (fraction of beat_period)
-    frequency
-    duration
-    ...eof
-    */
+    
+
+
    _notes.reserve(128);
     String s = file.readStringUntil('\n');
     beat_period = s.toInt();
@@ -1737,7 +2600,7 @@ bool BWC::_load_melody_json(const String& filename)
         n.duration_ms = beat_period * s.toFloat();
         n.duration_ms *= note_duty_cycle;
         _notes.push_back(n);
-        /*add a little break between the notes (will be placed before each note due to reversing)*/
+        
         n.frequency_hz = 0;
         n.duration_ms = beat_period * s.toFloat();
         n.duration_ms *= (1-note_duty_cycle);
@@ -1750,21 +2613,6 @@ bool BWC::_load_melody_json(const String& filename)
     return true;
 }
 
-// void BWC::_add_melody(const String &filename)
-// {
-//     if(_notes.size() || !_audio_enabled) return;
-//     File file = LittleFS.open(filename, "r");
-//     if (!file) return;
-//     while(file.available())
-//     {
-//         sNote n;
-//         file.readBytes((char*)&n, sizeof(n));
-//         _notes.push_back(n);
-//     }
-//     file.close();
-//     /* We read and erase from the back of the vector (faster) so if notes are stored in the natural order we need to reverse*/
-//     std::reverse(_notes.begin(), _notes.end());
-// }
 
 void BWC::_sweepdown()
 {
@@ -1819,7 +2667,7 @@ void BWC::_accord()
     }
 }
 
-// --- Smart Schedule (predictive heating) ---
+
 bool BWC::setSmartSchedule(uint64_t target_time, uint8_t target_temp, bool keep_heater_on, int pool_capacity)
 {
     const uint64_t now = (uint64_t)time(nullptr);
@@ -1852,38 +2700,6 @@ void BWC::cancelSmartSchedule()
 {
     if(_smart_schedule.heater_started_by_schedule && cio && cio->cio_states.heat) { command_que_item i{0,0,SETHEATER,0,""}; add_command(i); }
     if(_smart_schedule.temp_reading_started_pump && cio && cio->cio_states.pump && !cio->cio_states.heat) { command_que_item i{0,0,SETPUMP,0,""}; add_command(i); }
-    _resetSmartScheduleState();
-}
-
-void BWC::handleSmartScheduleWebOverride(Commands cmd)
-{
-    if(!_smart_schedule.active) return;
-
-    // Die Schalter auf der Hauptseite sind genauso eine bewusste manuelle
-    // Bedienung wie ein Tastendruck am Pumpenpanel. HEAT und PUMP beenden
-    // deshalb einen aktiven Smart Schedule, bevor der Web-Befehl in die
-    // normale Befehlswarteschlange aufgenommen wird. Dadurch kann ein bereits
-    // wartender automatischer EIN-Befehl den manuellen Wunsch nicht direkt
-    // wieder ueberschreiben.
-    if(cmd != SETHEATER && cmd != SETPUMP) return;
-
-    _command_que.erase(std::remove_if(_command_que.begin(), _command_que.end(),
-        [this](const command_que_item& item){
-            const bool immediateInternal =
-                (item.interval == 0 && item.xtime == 0 && item.text.length() == 0);
-            if(!immediateInternal) return false;
-            if(item.cmd == SETHEATER && item.val == 1) return true;
-            if(item.cmd == SETTARGET && item.val == _smart_schedule.target_temp) return true;
-            if(item.cmd == SETPUMP && item.val == 1) return true;
-            return false;
-        }),
-        _command_que.end());
-
-    _save_cmdq_needed = true;
-
-    // Kein zusaetzlicher AUS-Befehl: Der unmittelbar folgende Web-Befehl
-    // setzt den vom Benutzer gewaehlten Zustand selbst. Ein zweiter Toggle
-    // koennte sonst den Zustand wieder umkehren.
     _resetSmartScheduleState();
 }
 
@@ -1941,11 +2757,11 @@ void BWC::_handleSmartSchedulePanelOverride()
 
     const Buttons button = dsp->dsp_toggles.pressed_button;
 
-    // Ein echter Tastendruck am Pumpenpanel hat immer Vorrang vor Smart
-    // Schedule. HEAT beendet den Zeitplan direkt. PUMP und POWER beenden ihn
-    // ebenfalls, sobald der Heizbetrieb bereits begonnen hat bzw. unmittelbar
-    // bevorsteht. Dadurch kann Smart Schedule den manuellen AUS-Wunsch nicht
-    // im selben oder naechsten Loop wieder mit SETHEATER=1 ueberschreiben.
+    
+    
+    
+    
+    
     const bool heatOverride = (button == HEAT) || dsp->dsp_toggles.heat_change;
     const bool pumpOverride = (button == PUMP) || dsp->dsp_toggles.pump_change;
     const bool powerOverride = (button == POWER) || dsp->dsp_toggles.power_change;
@@ -1955,9 +2771,9 @@ void BWC::_handleSmartSchedulePanelOverride()
 
     if(!heatOverride && !(heatingPhase && (pumpOverride || powerOverride))) return;
 
-    // Bereits wartende, sofortige Smart-Schedule-/Restore-EIN-Befehle entfernen.
-    // Ohne diese Bereinigung koennte ein kurz zuvor eingereihter SETHEATER=1
-    // den physischen Tastendruck direkt wieder rueckgaengig machen.
+    
+    
+    
     _command_que.erase(std::remove_if(_command_que.begin(), _command_que.end(),
         [this](const command_que_item& item){
             const bool immediateInternal = (item.interval == 0 && item.xtime == 0 && item.text.length() == 0);
@@ -1970,9 +2786,9 @@ void BWC::_handleSmartSchedulePanelOverride()
         _command_que.end());
     _save_cmdq_needed = true;
 
-    // Nur den Smart-Schedule-Zustand verwerfen. Kein zusaetzlicher AUS-Befehl:
-    // Der aktuelle physische Tastendruck wird direkt danach unveraendert an die
-    // Pumpenelektronik weitergereicht. Ein zweiter Toggle waere hier falsch.
+    
+    
+    
     _resetSmartScheduleState();
 }
 

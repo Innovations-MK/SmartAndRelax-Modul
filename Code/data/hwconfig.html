@@ -5,10 +5,10 @@
 	<meta charset="utf-8">
 	<link rel="icon" type="image/png" sizes="180x180" href="favicon.png">
 	<meta name="theme-color" content="#0f4677">
-	<!-- <link rel="manifest" href="manifest.json"> -->
+	                                                   
 	<link rel="stylesheet" href="main.css">
 	<meta  name="viewport" content="width=device-width, initial-scale=1 maximum-scale=1">
-	<!-- <script src="function.js" type="text/javascript"></script> -->
+	                                                                   
 </head>
 
 <body>
@@ -28,23 +28,25 @@
 		<div class="topnav" id="topnav">
 			<a href="./">Hauptseite</a>
 			<a href="hwconfig.html" class="active">Hardware-Konfiguration</a>
-			<a href="config.html">SPA-Konfiguration</a>
+			<a href="smartschedule.html">Smart Schedule</a>
+        	<a href="config.html">SPA-Konfiguration</a>
 			<a href="webconfig.html">Web-Konfiguration</a>
 			<a href="wifi.html">Netzwerkkonfiguration</a>
-			<a href="mqtt.html">MQTT-Konfiguration</a>
+			<a href="mqtt.html">CLOUD/MQTT-Konfiguration</a>
+			<a href="updateonline.html">Online Update</a>
 			<a href="/restart/">SmartAndRelax Modul neu starten<a>
 		</div>
 
 
-        <!-- PRE2021,
-        MIAMI2021,
-        MALDIVES2021,
-        M54149E,
-        M54173,
-        M54154,
-        M54144,
-        M54138,
-        M54123 -->
+                     
+                  
+                     
+                
+               
+               
+               
+               
+                  
  
 
 		<h2>Hardware:</h2>
@@ -220,7 +222,7 @@
     return true;
   }
 
-  // Function to update the displayed number
+                                            
   function updateNumber(opt, parent) {
     var parentElement = parent.parentElement;
     var numDisplay = parentElement.querySelector(".numDisplay");
@@ -380,13 +382,13 @@ function setPins()
 		break;
 		default:
 			return;
-			// p1 = '';
-			// p2 = '';
-			// p3 = '';
-			// p4 = '';
-			// p5 = '';
-			// p6 = '';
-			// p7 = '';
+			           
+			           
+			           
+			           
+			           
+			           
+			           
 		break;
 	}
 	document.getElementById('pin1').value = p1;
@@ -426,7 +428,7 @@ function loadHardwareConfig()
 				document.getElementById('hasTempSensor').checked = true;
 			}
 			
-			// Set Temperature Sensor Pin from file
+			                                       
 			document.getElementById('pin8').value = json.pins[7];
 			if(json.pcb == 'custom')
 			{
@@ -443,7 +445,7 @@ function loadHardwareConfig()
 				setPins();
 			}
 
-			// Set power levels if override enabled
+			                                       
 			if (json.pwr_levels.override) {
 				[...document.querySelectorAll("input[id^='pwr_']")]
 				.forEach((e) => {

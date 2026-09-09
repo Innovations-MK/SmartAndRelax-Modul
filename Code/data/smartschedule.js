@@ -1,29 +1,15 @@
-/*
- * SmartAndRelax - Smart Schedule
- *
- * This file contains portions based on and adapted from the Smart Schedule implementation
- * of the GPL-3.0 licensed WifiWhirl project:
- * https://github.com/WifiWhirl/WifiWhirl-Software
- *
- * SmartAndRelax modifications by Michael Krenner / MK-Innovations.
- * Modified for SmartAndRelax firmware 3.1.5, 2026-07-20.
- *
- * Licensed under the GNU General Public License v3.0.
- * See the LICENSE file in the repository root for details.
- */
-
-/**
- * Smart Schedule
- * Handles UI interaction and communication with the SmartAndRelax firmware
- */
+   
+                 
+                                                                           
+   
 
 let scheduleUpdateInterval = null;
 
-/**
- * Load smart schedule on page load
- */
+   
+                                   
+   
 function loadSmartSchedule() {
-  // Set default datetime to today at 19:00
+                                           
   const today = new Date();
   const year = today.getFullYear();
   const month = String(today.getMonth() + 1).padStart(2, "0");
@@ -31,18 +17,18 @@ function loadSmartSchedule() {
   document.getElementById("targetDateTime").value =
     year + "-" + month + "-" + day + "T19:00";
 
-  // Fetch current global target temperature and set as default
+                                                               
   fetchGlobalTargetTemp();
   fetchPoolCapacity();
 
-  // Start updating schedule status
+                                   
   updateScheduleStatus();
-  scheduleUpdateInterval = setInterval(updateScheduleStatus, 5000); // Update every 5 seconds
+  scheduleUpdateInterval = setInterval(updateScheduleStatus, 5000);                          
 }
 
-/**
- * Fetch global target temperature to pre-fill the form
- */
+   
+                                                       
+   
 function fetchGlobalTargetTemp() {
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/getsmartschedule/", true);
@@ -52,7 +38,7 @@ function fetchGlobalTargetTemp() {
     if (xhr.readyState === 4 && xhr.status === 200) {
       try {
         const data = JSON.parse(xhr.responseText);
-        // Set global target temperature as default for new schedules
+                                                                     
         if (data.GLOBALTARGET && data.GLOBALTARGET > 0) {
           document.getElementById("targetTemp").value = data.GLOBALTARGET;
         }
@@ -82,9 +68,9 @@ function fetchPoolCapacity() {
   xhr.send("{}");
 }
 
-/**
- * Update schedule status display
- */
+   
+                                 
+   
 function updateScheduleStatus() {
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/getsmartschedule/", true);
@@ -104,13 +90,13 @@ function updateScheduleStatus() {
   xhr.send("{}");
 }
 
-/**
- * Display schedule status in UI
- */
+   
+                                
+   
 function displayScheduleStatus(data) {
   const isActive = data.ACTIVE || false;
 
-  // Show/hide sections based on active state
+                                             
   document.getElementById("statusActive").style.display = isActive
     ? "block"
     : "none";
@@ -119,7 +105,7 @@ function displayScheduleStatus(data) {
     : "block";
 
   if (isActive) {
-    // Update status fields
+                           
     document.getElementById("statusTargetTemp").textContent =
       data.TARGETTEMP || "--";
     document.getElementById("statusCurrentTemp").textContent =
@@ -129,7 +115,7 @@ function displayScheduleStatus(data) {
         ? data.ACCURATETEMP + " °C"
         : "Wird gemessen...";
 
-    // Display heating estimate (raw, without buffer)
+                                                     
     if (data.ESTIMATE >= 999) {
       document.getElementById("statusEstimate").innerHTML =
         '<span style="color: #ff9800;">Aufheizen unter diesen Bedingungen nicht berechenbar</span>';
@@ -139,7 +125,7 @@ function displayScheduleStatus(data) {
       var estimateSeconds = Math.round(data.ESTIMATE * 3600);
       document.getElementById("statusEstimate").textContent =
         formatDuration(estimateSeconds);
-      // Display safety buffer
+                              
       var bufferSeconds = Math.round((data.BUFFER || 0) * 3600);
       document.getElementById("statusBuffer").textContent =
         bufferSeconds > 0 ? formatDuration(bufferSeconds) : "--";
@@ -160,11 +146,11 @@ function displayScheduleStatus(data) {
       ? "true"
       : "false";
 
-    // Display remaining heating time (live countdown while heater is running)
-    // Use the same dynamic calculation as the dashboard ("Bereit in" / T2R)
+                                                                              
+                                                                            
     var remainingRow = document.getElementById("statusRemainingRow");
     if (data.HEATER && data.REMAINING_HEATING_TIME !== undefined && data.REMAINING_HEATING_TIME >= 0) {
-      // Backend calculates this dynamically using the same physics as dashboard T2R
+                                                                                    
       var remainingHours = data.REMAINING_HEATING_TIME;
       remainingRow.style.display = "table-row";
       if (remainingHours === 0) {
@@ -188,20 +174,20 @@ function displayScheduleStatus(data) {
       remainingRow.style.display = "none";
     }
 
-    // Display heater status
+                            
     const heaterStatus = data.HEATER
       ? '<span style="color: #4caf50; font-weight: bold;">🔥 EIN</span>'
       : '<span style="color: #999;">AUS</span>';
     document.getElementById("statusHeater").innerHTML = heaterStatus;
 
-    // Display status message (heating in progress or temp reading)
+                                                                   
     if (data.HEATER) {
-      // Heater is on - show heating message
+                                            
       document.getElementById("statusReadingStateText").innerHTML =
         '<span style="color: #4caf50; font-weight: bold;">🔥 Automatisches Aufheizen läuft.</span>';
       document.getElementById("statusReadingState").style.display = "table-row";
     } else if (data.READING_STATE > 0) {
-      // Not heating, but in temp reading mode
+                                              
       const readingStates = [
         "",
         "Temperaturmessung wird vorbereitet",
@@ -216,14 +202,14 @@ function displayScheduleStatus(data) {
       document.getElementById("statusReadingState").style.display = "none";
     }
 
-    // Format target time
+                         
     if (data.TARGETTIME) {
       const targetDate = new Date(data.TARGETTIME * 1000);
       document.getElementById("statusTargetTime").textContent =
         formatDateTime(targetDate);
     }
 
-    // Format start time
+                        
     if (data.STARTTIME && data.STARTTIME > 0) {
       const startDate = new Date(data.STARTTIME * 1000);
       document.getElementById("statusStartTime").textContent =
@@ -233,7 +219,7 @@ function displayScheduleStatus(data) {
         "Wird berechnet...";
     }
 
-    // Format next check time (or show "completed" status)
+                                                          
     if (data.CHECKCOMPLETED) {
       document.getElementById("statusNextCheck").innerHTML =
         '<span style="color: #4caf50; font-weight: bold;">Planung abgeschlossen</span>';
@@ -243,22 +229,22 @@ function displayScheduleStatus(data) {
         formatDateTime(nextCheckDate);
     }
 
-    // Calculate and display time remaining
+                                           
     if (data.TIMEREMAINING) {
       document.getElementById("statusTimeRemaining").textContent =
         formatDuration(data.TIMEREMAINING);
     }
 
-    // Calculate and display time until start
+                                             
     if (data.STARTTIME && data.STARTTIME > 0) {
-      // Only show time until start if a start time has been calculated
+                                                                       
       const timeUntilStart = data.TIMEUNTILSTART;
       if (timeUntilStart <= 0 && data.HEATER) {
-        // Show "now running" only if heater is actually on
+                                                           
         document.getElementById("statusTimeUntilStart").innerHTML =
           '<span style="color: #4caf50; font-weight: bold;">Aufheizen läuft</span>';
       } else if (timeUntilStart <= 0) {
-        // Start time reached but heater not on yet (starting soon)
+                                                                   
         document.getElementById("statusTimeUntilStart").innerHTML =
           '<span style="color: #ff9800;">Heizstart wird vorbereitet...</span>';
       } else {
@@ -266,16 +252,16 @@ function displayScheduleStatus(data) {
           formatDuration(timeUntilStart);
       }
     } else {
-      // No start time calculated yet - still measuring
+                                                       
       document.getElementById("statusTimeUntilStart").innerHTML =
         '<span style="color: #2196f3;">Wird berechnet...</span>';
     }
   }
 }
 
-/**
- * Format Unix timestamp to readable date/time
- */
+   
+                                              
+   
 function formatDateTime(date) {
   const day = String(date.getDate()).padStart(2, "0");
   const month = String(date.getMonth() + 1).padStart(2, "0");
