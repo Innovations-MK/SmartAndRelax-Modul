@@ -13,15 +13,33 @@ The complete license text is available in the `LICENSE` file.
 
 The source code for SmartAndRelax is provided in this repository.
 
-Historical SmartAndRelax releases and their corresponding source archives are documented through GitHub releases and tags.
+This source release is **4.0.0**. Use release archives and Git tags to retain this version.
 
-For release-specific changes and dates, see:
+For release-specific changes and dates, see `CHANGELOG.md`, the Git history and the corresponding GitHub releases. Additional copyright and attribution information is available in `NOTICE.md`.
 
-- `CHANGELOG.md`
-- the Git history
-- the corresponding GitHub releases
+## Build and installation
 
-Additional copyright and attribution information is available in `NOTICE.md`.
+The PlatformIO project is located in `Code/`. Install PlatformIO and use the dependencies specified in `Code/platformio.ini`.
+
+```sh
+cd Code
+pio run -e d1_mini_pro
+pio run -e d1_mini_pro -t buildfs
+```
+
+To install a self-built image via USB, select the correct board and serial port. The standard PlatformIO targets are:
+
+```sh
+cd Code
+pio run -e d1_mini_pro -t uploadfs
+pio run -e d1_mini_pro -t upload
+```
+
+Use the appropriate environment for your ESP8266 board. Flashing or erasing a device may remove saved settings and credentials; keep a backup before modifying an existing device.
+
+## Local configuration
+
+An optional configuration example is provided at `Code/src/sar_private_config.example.h`. Local configuration belongs in `Code/src/sar_private_config.h`. Keep this file and any individual credentials or private keys outside the public repository.
 
 ## SmartAndRelax modifications
 
@@ -33,6 +51,4 @@ Existing copyright, authorship and license notices from the original project and
 
 The SmartAndRelax hardware is also based in substantial part on the original visualapproach project.
 
-A fully configured SmartAndRelax module is available at:
-
-https://www.mk-innovations.de
+Fully configured SmartAndRelax hardware is available separately.

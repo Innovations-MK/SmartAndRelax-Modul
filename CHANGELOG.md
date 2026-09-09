@@ -1,13 +1,11 @@
 # Changelog
 
-This changelog documents notable SmartAndRelax release versions. Historical entries are based on the available release archives and are not intended to rewrite the original source history.
+## SmartAndRelax 4.0.0
 
-## 2.0.0 – 2024-07-04
+- Initial 4.x public source release.
+- Firmware and user-interface extensions.
 
-**Internal firmware identifier:** `2024-07-04-001`
+## SmartAndRelax 3.1.5
 
-Historical SmartAndRelax release based on the GPL-3.0-licensed **WiFi remote for Bestway Lay-Z-SPA** project by visualapproach and contributors.
-
-The historical source code is preserved in its original state. The corresponding original release binaries are archived with the GitHub release.
-
-Further historical SmartAndRelax releases will be added as their corresponding source archives are verified.
+- Previous public source release.
+- Smart Schedule and stability improvements.
