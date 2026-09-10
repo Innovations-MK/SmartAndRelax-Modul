@@ -73,7 +73,11 @@ void DSP_6_TYPE1::clearpayload()
 
 Buttons DSP_6_TYPE1::getPressedButton()
 {
-    if(millis() - _dsp_getbutton_last_time < 90)
+                                                                       
+                                                                              
+                                                                         
+                                                    
+    if(millis() - _dsp_getbutton_last_time < _button_poll_interval_ms)
         return _old_button;
 
     uint16_t newButtonCode = 0;

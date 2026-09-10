@@ -44,6 +44,10 @@ class CIO
         uint32_t target_capture_last_button_ms = 0;
         uint32_t target_capture_arm_count = 0;
         uint32_t target_capture_accept_count = 0;
+        // TouchFast1 diagnostics. Zero on models/paths that do not use the
+        // 6-wire physical UP/DOWN acceleration.
+        uint32_t physical_target_preempt_count = 0;
+        uint32_t physical_target_immediate_start_count = 0;
         uint8_t target_capture_last_value = 0;
         uint32_t target_capture_last_value_ms = 0;
         std::vector<uint8_t> _raw_payload_to_cio = {0,0,0,0,0,0,0,0,0,0,0};

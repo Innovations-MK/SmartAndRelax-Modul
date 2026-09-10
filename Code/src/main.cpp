@@ -1,5 +1,6 @@
 #include "main.h"
 #include "mqtt_ca.h"
+#include "mqtt_cloud_ca_root_ye.h"
 #include "cloud_v2_credentials.h"
 void sarRunPendingOnlineUpdate();
 static void sarHandleSerialProvisioning();
@@ -312,7 +313,7 @@ static const uint32_t PRESENCE_MQTT_FRESH_MAX_AGE_MS = 180000UL;
 
 
                                                       
-static const char* SAR_BUILD_ID = "Phase15-Harden4";
+static const char* SAR_BUILD_ID = "Phase15-Harden4-TargetGuardFix1-TouchFast1-AutoLockSafe-ShortChain8884Test";
 static String g_boot_diag;
 static uint32_t g_boot_millis = 0;
 static uint32_t g_boot_id = 0;
@@ -465,7 +466,14 @@ void sarMarkedRestart(const char* reason)
  };
 
  static SarCloudTlsClient          tlsClientStatic;
+
+                                                                        
+                                                                              
  static BearSSL::X509List          tlsCaStatic(SAR_MQTT_CA_CERT);
+
+                           
+ static BearSSL::X509List          mqttCloudCaRootYeStatic(SAR_MQTT_CLOUD_ROOT_YE_CERT);
+
  static BearSSL::Session           mqttTlsSessionStatic;
 
                                                                
@@ -473,7 +481,7 @@ void sarMarkedRestart(const char* reason)
 
                            
  BearSSL::WiFiClientSecureCtx *tlsClient = &tlsClientStatic;
- BearSSL::X509List            *tlsCa     = &tlsCaStatic;
+ BearSSL::X509List            *tlsCa     = &mqttCloudCaRootYeStatic;
 
  static void generateBootId()
  {
@@ -2619,7 +2627,7 @@ static void hardResetMqttStack(const char* reason)
     }
                                                  
     tlsClient   = &tlsClientStatic;
-    tlsCa       = &tlsCaStatic;
+    tlsCa       = &mqttCloudCaRootYeStatic;
     aWifiClient = tlsClient;
     mqttClient  = &mqttClientStatic;
     mqttClient->setClient(*aWifiClient);
@@ -3420,22 +3428,7 @@ void write_mem_stats_to_file()
     
 
 
-                                                                                
                 
-                                                                                
-                                                                              
-                                                                                
-                                                                     
-  
-              
-                              
-                                                         
-  
-                                                                              
-                                                                              
-                                                                              
-                                                                                
-                                                                                
 static const char* SAR_UPDATE_HOST     PROGMEM = SAR_PUBLIC_UPDATE_HOST;
 static const char* SAR_UPDATE_INFO_URL PROGMEM = SAR_PUBLIC_UPDATE_INFO_URL;
 static const char* SAR_DEFAULT_FW_URL  PROGMEM = "";
@@ -3666,8 +3659,10 @@ static bool sarOtaEnsureValidTime(uint32_t waitMs = 10000UL)
 static std::unique_ptr<BearSSL::WiFiClientSecure> sarMakeSecureClient(uint32_t timeoutMs, uint16_t rxSize = 4096, uint16_t txSize = 512)
 {
     std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-                                                                                       
-    client->setTrustAnchors(tlsCa);
+                                   
+                                                                     
+                                                                             
+    client->setTrustAnchors(&tlsCaStatic);
     client->setSession(&sarOtaTlsSession);
     client->setTimeout(timeoutMs);
     client->setBufferSizes(rxSize, txSize);
@@ -4724,7 +4719,7 @@ void stopall()
     aWifiClient = tlsClient;                                   
                                                  
     tlsClient  = &tlsClientStatic;
-    tlsCa      = &tlsCaStatic;
+    tlsCa      = &mqttCloudCaRootYeStatic;
     aWifiClient = tlsClient;
     mqttClient  = &mqttClientStatic;
     mqttClient->setClient(*aWifiClient);
@@ -4736,7 +4731,7 @@ void stopall()
 
 
                                              
-    presenceClient.stop();
+    presenceClient.stop();                        
                                        
     presenceTlsReady = false;
 
@@ -7113,7 +7108,7 @@ void startMqtt()
     if (mqttCloudMode) {
                                                              
         tlsClient = &tlsClientStatic;
-        tlsCa     = &tlsCaStatic;
+        tlsCa     = &mqttCloudCaRootYeStatic;
 
         tlsClient->setTrustAnchors(tlsCa);
                                                                                 

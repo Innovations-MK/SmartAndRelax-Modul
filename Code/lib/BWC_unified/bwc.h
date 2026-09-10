@@ -7,10 +7,10 @@
 #endif
 
 #include "Arduino.h"
-
+//long long needed in arduino core v3+
 #define ARDUINOJSON_USE_LONG_LONG 1
 #include <ArduinoJson.h>
-
+// #include "ESPDateTime.h"
 #include <LittleFS.h>
 #include <Ticker.h>
 #include <vector>
@@ -80,16 +80,16 @@ class BWC {
         void loop();
         void adjust_brightness();
         void play_sound();
-        
-        
-        
-        
+        // String get_fromcio();
+        // String get_todsp();
+        // String get_fromdsp();
+        // String get_tocio();
         void stop(void);
         void pause_all(bool action);
         bool add_command(command_que_item command_item);
         bool edit_command(uint8_t index, command_que_item command_item);
         bool del_command(uint8_t index);
-        
+        // bool qCommand(int64_t cmd, int64_t val, int64_t xtime, int64_t interval);
         bool newData();
         void getJSONStates(String &rtn);
         void getJSONTimes(String &rtn);
@@ -97,7 +97,7 @@ class BWC {
         void setJSONSettings(const String& message);
         String getJSONCommandQueue();
         uint8_t getState(int state);
-        
+        // void saveSettingsFlag();
         void saveSettings();
         void reloadCommandQueue();
         void reloadSettings();
@@ -119,7 +119,7 @@ class BWC {
         void cancelSmartSchedule();
         void getJSONSmartSchedule(String &rtn);
 
-        
+        // String getDebugData();
 
     public:
         time_t reboot_time_t;
@@ -155,6 +155,10 @@ class BWC {
         uint8_t _lastSafeTargetForCurrentUnit() const;
         void _setLastSafeTargetFromCurrentUnit(uint8_t target);
         bool _targetLooksSuspicious(uint8_t target) const;
+        void _beginTargetSetTransition(uint8_t startTarget, uint8_t goalTarget);
+        void _cancelTargetSetTransition();
+        bool _targetSetTransitionExpected(uint8_t liveTarget) const;
+        void _observeTargetSetTransition(uint8_t liveTarget);
         uint8_t _guardedTargetForSave() const;
         bool _queueStateRestoreCommand(Commands cmd, uint8_t val);
         void _clearInternalRestoreCommands(bool pump, bool heat);
@@ -186,8 +190,8 @@ class BWC {
         void _resetSmartScheduleState();
 
     private:
-        uint64_t _timestamp_secs; 
-        double _energy_daily_Ws; 
+        uint64_t _timestamp_secs; // seconds
+        double _energy_daily_Ws; //Wattseconds internally
         unsigned long _temp_change_timestamp_ms, _heatred_change_timestamp_ms;
         unsigned long _pump_change_timestamp_ms, _bubbles_change_timestamp_ms;
         Ticker _save_settings_ticker;
@@ -218,16 +222,16 @@ class BWC {
         int _notification_time, _next_notification_time;
         int _energy_power_W;
         int _ticker_count;
-        int _btn_sequence[4] = {NOBTN,NOBTN,NOBTN,NOBTN}; 
-        int _ambient_temp; 
+        int _btn_sequence[4] = {NOBTN,NOBTN,NOBTN,NOBTN}; //keep track of the four latest button presses
+        int _ambient_temp; //always in C internally
         int _deltatemp;
         float _price;
-        float _energy_total_kWh;
+        double _energy_total_kWh;
         double _energy_cost;
         float _R_COOLING = 40;
-        float _heating_degperhour = 1.5; 
-        float _virtual_temp; 
-        float _virtual_temp_fix; 
+        float _heating_degperhour = 1.5; //always in C internally
+        float _virtual_temp; //=virtualtempfix+calculated diff, always in C internally
+        float _virtual_temp_fix; //last fixed data point to add or subtract temp from, always in C internally
         Buttons _prevbutton = NOBTN;
         int16_t _override_dsp_brt_timer;
         uint8_t _dsp_brightness;
@@ -247,12 +251,12 @@ class BWC {
         int _pool_capacity = 700;
         bool _save_smartschedule_needed = false;
 
-        
+        // --- SmartAndRelax FLT/HTR Safe-State Guard ---
         bool _has_last_safe_states = false;
         uint8_t _last_safe_pump = 0;
         uint8_t _last_safe_heat = 0;
         uint8_t _last_safe_target = 20;
-        uint8_t _last_safe_unit = 1; 
+        uint8_t _last_safe_unit = 1; // 1 = Celsius, 0 = Fahrenheit
         uint8_t _last_safe_god = 0;
 
         uint32_t _last_pump_cmd_ms = 0;
@@ -269,14 +273,29 @@ class BWC {
         uint32_t _target_suspicious_since_ms = 0;
         uint32_t _last_target_restore_ms = 0;
 
+        // Explicit SETTARGET transition guard. On 6-wire pumps a large target
+        // jump is performed as a sequence of real UP/DOWN presses. Intermediate
+        // values are expected progress, but must never replace the user's final
+        // requested target or trigger a restore to the previous target.
+        bool _target_set_in_progress = false;
+        uint8_t _target_set_start = 0;
+        uint8_t _target_set_goal = 0;
+        uint8_t _target_set_last_live = 0;
+        uint32_t _target_set_started_ms = 0;
+        uint32_t _target_set_last_progress_ms = 0;
+        uint32_t _target_set_progress_count = 0;
+        uint32_t _target_set_complete_count = 0;
+        uint32_t _target_set_abort_count = 0;
+        uint32_t _target_guard_deferred_for_set_count = 0;
+
         uint32_t _state_guard_skip_count = 0;
         uint32_t _live_safe_restore_count = 0;
         uint32_t _target_live_restore_count = 0;
         uint32_t _target_force_read_count = 0;
         bool _force_next_settarget = false;
 
-        
-        
+                                                                               
+                                                                                          
         uint32_t _cloud_poll_guard_until_ms = 0;
         uint32_t _cloud_poll_guard_started_ms = 0;
         uint32_t _cloud_poll_guard_count = 0;
@@ -285,9 +304,9 @@ class BWC {
         uint32_t _cloud_poll_guard_state_skip_count = 0;
         uint32_t _cloud_poll_guard_save_skip_count = 0;
 
-        
-        
-        
+                                                                                    
+                                                                                      
+                                                                                          
         bool _cloud_pre_state_valid = false;
         bool _cloud_post_restore_pending = false;
         uint8_t _cloud_pre_pump = 0;

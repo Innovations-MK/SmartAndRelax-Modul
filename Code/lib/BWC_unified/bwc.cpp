@@ -35,6 +35,15 @@ BWC::BWC()
     _heatingtime = 0;
     _airtime = 0;
     _jettime = 0;
+    _uptime_ms = 0;
+    _pumptime_ms = 0;
+    _heatingtime_ms = 0;
+    _airtime_ms = 0;
+    _jettime_ms = 0;
+    _energy_daily_Ws = 0;
+    _energy_power_W = 0;
+    _energy_total_kWh = 0;
+    _energy_cost = 0;
     _price = 1;
     _filter_rinse_interval = 7;
     _filter_clean_interval = 20;
@@ -93,6 +102,11 @@ static const uint32_t SAR_PUMP_OFF_OBSERVE_MS      = 30000UL;
 static const uint32_t SAR_RECENT_TARGET_WINDOW_MS  = 30000UL;
 static const uint32_t SAR_TARGET_RESTORE_DELAY_MS   = 20000UL;
 static const uint32_t SAR_TARGET_RESTORE_GAP_MS     = 60000UL;
+// A 6-wire target jump is generated through repeated real UP/DOWN presses.
+// 90 s comfortably covers the full Celsius/Fahrenheit range plus unlock/loop
+// delays, while still allowing the normal target guard to recover a truly
+// stalled transition afterwards.
+static const uint32_t SAR_TARGET_SET_MAX_MS         = 90000UL;
 
 
 void BWC::beginCloudPollingGuard(uint32_t maxActiveMs)
@@ -334,6 +348,86 @@ void BWC::_setLastSafeTargetFromCurrentUnit(uint8_t target)
     _last_safe_target = target;
 }
 
+void BWC::_beginTargetSetTransition(uint8_t startTarget, uint8_t goalTarget)
+{
+    const uint32_t now = millis();
+
+    if(_target_set_in_progress)
+        _target_set_abort_count++;
+
+    _target_set_start = startTarget;
+    _target_set_goal = goalTarget;
+    _target_set_last_live = startTarget;
+    _target_set_started_ms = now;
+    _target_set_last_progress_ms = now;
+
+                                                                              
+                                                              
+    _target_set_in_progress = (cio != nullptr &&
+                               _targetIsPlausibleForUnit(startTarget, cio->cio_states.unit) &&
+                               _targetIsPlausibleForUnit(goalTarget, cio->cio_states.unit) &&
+                               startTarget != goalTarget);
+}
+
+void BWC::_cancelTargetSetTransition()
+{
+    if(_target_set_in_progress)
+        _target_set_abort_count++;
+    _target_set_in_progress = false;
+}
+
+bool BWC::_targetSetTransitionExpected(uint8_t liveTarget) const
+{
+    if(!_target_set_in_progress || cio == nullptr)
+        return false;
+
+    if((uint32_t)(millis() - _target_set_started_ms) >= SAR_TARGET_SET_MAX_MS)
+        return false;
+
+    if(!_targetIsPlausibleForUnit(liveTarget, cio->cio_states.unit))
+        return false;
+
+    if(_target_set_goal > _target_set_start)
+        return (liveTarget >= _target_set_start && liveTarget <= _target_set_goal);
+
+    if(_target_set_goal < _target_set_start)
+        return (liveTarget <= _target_set_start && liveTarget >= _target_set_goal);
+
+    return (liveTarget == _target_set_goal);
+}
+
+void BWC::_observeTargetSetTransition(uint8_t liveTarget)
+{
+    if(!_target_set_in_progress)
+        return;
+
+    const uint32_t now = millis();
+
+    if((uint32_t)(now - _target_set_started_ms) >= SAR_TARGET_SET_MAX_MS)
+    {
+        _target_set_in_progress = false;
+        _target_set_abort_count++;
+        return;
+    }
+
+    if(!_targetSetTransitionExpected(liveTarget))
+        return;
+
+    if(liveTarget != _target_set_last_live)
+    {
+        _target_set_last_live = liveTarget;
+        _target_set_last_progress_ms = now;
+        _target_set_progress_count++;
+    }
+
+    if(liveTarget == _target_set_goal)
+    {
+        _target_set_in_progress = false;
+        _target_set_complete_count++;
+        _target_suspicious_since_ms = 0;
+    }
+}
+
 bool BWC::_targetLooksSuspicious(uint8_t target) const
 {
     if(cio == nullptr)
@@ -379,6 +473,12 @@ bool BWC::_targetLooksSuspicious(uint8_t target) const
 
 uint8_t BWC::_guardedTargetForSave() const
 {
+                                                                            
+                                                                           
+                                                                          
+    if(_target_set_in_progress && _has_last_safe_states)
+        return _lastSafeTargetForCurrentUnit();
+
     if(cloudPollingGuardActive() && _has_last_safe_states)
         return _lastSafeTargetForCurrentUnit();
 
@@ -549,6 +649,16 @@ void BWC::_enforceSafeTargetState(const char* reason)
     const uint8_t liveTarget = cio->cio_states.target;
     const uint32_t now = millis();
 
+    // A commanded 6-wire target change legitimately passes through many
+    // intermediate values. Never let the SafeGuard interpret those values as
+    // corruption and restore the previous target while the transition runs.
+    if(_targetSetTransitionExpected(liveTarget))
+    {
+        _target_suspicious_since_ms = 0;
+        _target_guard_deferred_for_set_count++;
+        return;
+    }
+
                                                                            
                                                                           
     if(!_targetLooksSuspicious(liveTarget))
@@ -644,6 +754,36 @@ void BWC::getPumpDiag(String &rtn)
     rtn += F("\ntargetSuspiciousAgeMs: ");
     rtn += String((_target_suspicious_since_ms == 0) ? 0UL : (uint32_t)(millis() - _target_suspicious_since_ms));
 
+    rtn += F("\ntargetSetInProgress: ");
+    rtn += _target_set_in_progress ? F("1") : F("0");
+
+    rtn += F("\ntargetSetStart: ");
+    rtn += String(_target_set_start);
+
+    rtn += F("\ntargetSetGoal: ");
+    rtn += String(_target_set_goal);
+
+    rtn += F("\ntargetSetLastLive: ");
+    rtn += String(_target_set_last_live);
+
+    rtn += F("\ntargetSetAgeMs: ");
+    rtn += String((_target_set_started_ms == 0) ? 0UL : (uint32_t)(millis() - _target_set_started_ms));
+
+    rtn += F("\ntargetSetLastProgressAgeMs: ");
+    rtn += String((_target_set_last_progress_ms == 0) ? 0UL : (uint32_t)(millis() - _target_set_last_progress_ms));
+
+    rtn += F("\ntargetSetProgressCount: ");
+    rtn += String(_target_set_progress_count);
+
+    rtn += F("\ntargetSetCompleteCount: ");
+    rtn += String(_target_set_complete_count);
+
+    rtn += F("\ntargetSetAbortCount: ");
+    rtn += String(_target_set_abort_count);
+
+    rtn += F("\ntargetGuardDeferredForSetCount: ");
+    rtn += String(_target_guard_deferred_for_set_count);
+
     rtn += F("\nhasLastSafeStates: ");
     rtn += _has_last_safe_states ? F("1") : F("0");
 
@@ -703,6 +843,9 @@ void BWC::getPumpDiag(String &rtn)
         rtn += F("\nlivePowerState: ");
         rtn += String(cio->cio_states.power ? 1 : 0);
 
+        rtn += F("\nliveLockedState: ");
+        rtn += String(cio->cio_states.locked ? 1 : 0);
+
         rtn += F("\nlivePumpState: ");
         rtn += String(cio->cio_states.pump ? 1 : 0);
 
@@ -758,6 +901,12 @@ void BWC::getPumpDiag(String &rtn)
         rtn += F("\nliveButtonQueueLength: ");
         rtn += String(cio->_button_que_len);
 
+        rtn += F("\nphysicalTargetPreemptCount: ");
+        rtn += String(cio->physical_target_preempt_count);
+
+        rtn += F("\nphysicalTargetImmediateStartCount: ");
+        rtn += String(cio->physical_target_immediate_start_count);
+
         rtn += F("\ncioGoodPackets: ");
         rtn += String(cio->good_packets_count);
 
@@ -777,6 +926,7 @@ void BWC::getPumpDiag(String &rtn)
     {
         rtn += F("\ncioModel: (none)");
         rtn += F("\nlivePowerState: -1");
+        rtn += F("\nliveLockedState: -1");
         rtn += F("\nlivePumpState: -1");
         rtn += F("\nliveHeatState: -1");
         rtn += F("\nliveTargetState: -1");
@@ -791,6 +941,8 @@ void BWC::getPumpDiag(String &rtn)
         rtn += F("\ntargetCaptureLastValue: -1");
         rtn += F("\ntargetCaptureLastValueAgeMs: -1");
         rtn += F("\nliveButtonQueueLength: -1");
+        rtn += F("\nphysicalTargetPreemptCount: -1");
+        rtn += F("\nphysicalTargetImmediateStartCount: -1");
         rtn += F("\ncioGoodPackets: -1");
         rtn += F("\ncioBadPackets: -1");
         rtn += F("\ntargetLooksSuspicious: -1");
@@ -1095,11 +1247,13 @@ void BWC::play_sound()
         {
             case UP:
                 if(dsp->EnabledButtons[UP]) _beep();
+                _cancelTargetSetTransition();
                 _dsp_tgt_used = true;
                 _last_target_button_ms = millis();
                 break;
             case DOWN:
                 if(dsp->EnabledButtons[DOWN]) _beep();
+                _cancelTargetSetTransition();
                 _dsp_tgt_used = true;
                 _last_target_button_ms = millis();
                 break;
@@ -1225,6 +1379,19 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
         else
             cio->cio_toggles.target = val;
 
+        const uint8_t requestedTarget = cio->cio_toggles.target;
+        const uint8_t liveTargetAtCommand = cio->cio_states.target;
+
+        // The explicit SETTARGET value is user intent and therefore becomes the
+        // authoritative safe target immediately. This is critical for large
+        // 6-wire jumps: if the ESP resets halfway through 22->40, restore 40,
+        // never the previous 22. Intermediate live values remain progress only.
+        _beginTargetSetTransition(liveTargetAtCommand, requestedTarget);
+        _setLastSafeTargetFromCurrentUnit(requestedTarget);
+        _has_last_safe_states = true;
+        _target_suspicious_since_ms = 0;
+        _savePersistentSafeStates();
+
         // Interner Guard-/Restore-Fall:
         // Wenn die Pumpeneinheit nach einem Crash intern z. B. 38 °C hält,
         // das Modul aber noch 28 °C gecacht hat, würde SETTARGET 28 sonst
@@ -1247,6 +1414,9 @@ bool BWC::_handlecommand(Commands cmd, int64_t val, const String& txt="")
         break;
     }
     case SETUNIT:
+        // Unit changes invalidate the numeric start/goal range of an active
+        // target transition. Cancel it before converting the target values.
+        _cancelTargetSetTransition();
         if(hasgod && !cio->cio_toggles.godmode) break;
         if(val == 1 && cio->cio_states.unit == 0) cio->cio_toggles.target = round(F2C(cio->cio_toggles.target)); 
         if(val == 0 && cio->cio_states.unit == 1) cio->cio_toggles.target = round(C2F(cio->cio_toggles.target)); 
@@ -1437,6 +1607,7 @@ _clearInternalRestoreCommands(true, true);
         break;
     case RESETDAILY:
         _energy_daily_Ws = 0;
+        _save_settings_needed = true;
         _new_data_available = true;
         break;
     case SETGODMODE:
@@ -1574,16 +1745,40 @@ void BWC::_handleStateChanges()
 
     if(cio->cio_states.target != _prev_cio_states.target)
     {
-        // Wenn die Zieltemperatur direkt am Pumpendisplay geändert wurde,
-        // muss dieser gültige Live-Wert auch wieder als Web-/Safe-Ziel übernommen
-        // werden. Sonst kann die WebApp wegen des Target-Guards weiter den alten
-        // _web_target/_last_safe_target anzeigen.
-        if(!_targetLooksSuspicious(cio->cio_states.target))
+        const uint8_t liveTarget = cio->cio_states.target;
+        const bool transitionWasActive = _target_set_in_progress;
+        const uint8_t transitionGoal = _target_set_goal;
+        const bool expectedTransitionValue = _targetSetTransitionExpected(liveTarget);
+
+        if(transitionWasActive)
+            _observeTargetSetTransition(liveTarget);
+
+        if(transitionWasActive && expectedTransitionValue)
         {
-            _web_target = cio->cio_states.target;
-            _setLastSafeTargetFromCurrentUnit(cio->cio_states.target);
-            _has_last_safe_states = true;
-            _target_suspicious_since_ms = 0;
+            // Intermediate values are expected progress only. Do not copy them
+            // into _web_target/_last_safe_target, otherwise 22->40 would stop at
+            // the first observed 23/24/... value. Only the final goal is adopted.
+            if(liveTarget == transitionGoal)
+            {
+                _web_target = liveTarget;
+                _setLastSafeTargetFromCurrentUnit(liveTarget);
+                _has_last_safe_states = true;
+                _target_suspicious_since_ms = 0;
+            }
+        }
+        else
+        {
+            // Wenn die Zieltemperatur direkt am Pumpendisplay geändert wurde,
+            // muss dieser gültige Live-Wert auch wieder als Web-/Safe-Ziel übernommen
+            // werden. Sonst kann die WebApp wegen des Target-Guards weiter den alten
+            // _web_target/_last_safe_target anzeigen.
+            if(!_targetLooksSuspicious(liveTarget))
+            {
+                _web_target = liveTarget;
+                _setLastSafeTargetFromCurrentUnit(liveTarget);
+                _has_last_safe_states = true;
+                _target_suspicious_since_ms = 0;
+            }
         }
     }
 
@@ -2153,30 +2348,32 @@ void BWC::_updateTimes(){
         _airtime += _airtime_ms/1000;
         _jettime += _jettime_ms/1000;
         _uptime += _uptime_ms/1000;
-        _heatingtime_ms = 0;
-        _pumptime_ms = 0;
-        _airtime_ms = 0;
-        _jettime_ms = 0;
-        _uptime_ms = 0;
+        // Keep the sub-second remainder instead of discarding it.
+        _heatingtime_ms %= 1000;
+        _pumptime_ms %= 1000;
+        _airtime_ms %= 1000;
+        _jettime_ms %= 1000;
+        _uptime_ms %= 1000;
     }
 
     if(_override_dsp_brt_timer > 0) _override_dsp_brt_timer -= elapsedtime_ms; //counts down to or below zero
 
-    // watts, kWh today, total kWh
-    float heatingEnergy = (_heatingtime+_heatingtime_ms/1000)/3600.0 * cio->getHeaterPower();
-    float pumpEnergy = (_pumptime+_pumptime_ms/1000)/3600.0 * cio->getPowerLevels().PUMPPOWER;
-    float airEnergy = (_airtime+_airtime_ms/1000)/3600.0 * cio->getPowerLevels().AIRPOWER;
-    float idleEnergy = (_uptime+_uptime_ms/1000)/3600.0 * cio->getPowerLevels().IDLEPOWER;
-    float jetEnergy = (_jettime+_jettime_ms/1000)/3600.0 * cio->getPowerLevels().JETPOWER;
-    _energy_total_kWh = (heatingEnergy + pumpEnergy + airEnergy + idleEnergy + jetEnergy)/1000; //Wh -> kWh
+    // Current electrical load based on the configured SmartAndRelax power levels.
     _energy_power_W = cio->cio_states.heatred * cio->getHeaterPower();
     _energy_power_W += cio->cio_states.pump * cio->getPowerLevels().PUMPPOWER;
     _energy_power_W += cio->cio_states.bubbles * cio->getPowerLevels().AIRPOWER;
     _energy_power_W += cio->getPowerLevels().IDLEPOWER;
     _energy_power_W += cio->cio_states.jets * cio->getPowerLevels().JETPOWER;
 
-    _energy_daily_Ws += elapsedtime_ms * _energy_power_W / 1000.0;
-    _energy_cost += _price * _energy_power_W / (1000.0 * 1000.0 * 3600.0); // money/kWh
+    // Convert the power used during this real time interval to energy.
+    // kWh = W * ms / 3,600,000,000
+    _energy_total_kWh += static_cast<double>(_energy_power_W) * elapsedtime_ms / 3600000000.0;
+    _energy_daily_Ws += static_cast<double>(_energy_power_W) * elapsedtime_ms / 1000.0;
+
+                                                                              
+                                                                            
+                                                                              
+    _energy_cost = _energy_total_kWh * static_cast<double>(_price);
 
     if(_notes.size())
     {
@@ -2607,11 +2804,12 @@ void BWC::saveSettings(){
     _airtime += _airtime_ms/1000;
     _jettime += _jettime_ms/1000;
     _uptime += _uptime_ms/1000;
-    _heatingtime_ms = 0;
-    _pumptime_ms = 0;
-    _airtime_ms = 0;
-    _jettime_ms = 0;
-    _uptime_ms = 0;
+    // Preserve the fractions in RAM; only complete seconds are persisted.
+    _heatingtime_ms %= 1000;
+    _pumptime_ms %= 1000;
+    _airtime_ms %= 1000;
+    _jettime_ms %= 1000;
+    _uptime_ms %= 1000;
     // Set the values in the document
     doc[F("CLTIME")] = _cl_timestamp_s;
     doc[F("FREP")] = _filter_replace_timestamp_s;

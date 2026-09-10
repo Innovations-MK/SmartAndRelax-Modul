@@ -57,6 +57,9 @@ class DSP_6_TYPE1 : public DSP_6W
     protected:
         unsigned long _dsp_last_refreshtime = 0;
         unsigned long _dsp_getbutton_last_time = 0;
+        // Model-specific button poll interval. Miami2021 keeps the proven
+        // 90 ms timing; Maldives2021 may use the faster TouchFast interval.
+        uint16_t _button_poll_interval_ms = 90;
         int _CS_PIN;
         int _CLK_PIN;
         int _DATA_PIN;

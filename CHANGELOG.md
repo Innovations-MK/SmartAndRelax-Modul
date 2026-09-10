@@ -1,5 +1,10 @@
 # Changelog
 
+## SmartAndRelax 4.0.2
+
+- Pump communication, target-temperature and display improvements.
+- Maintenance and stability improvements.
+
 ## SmartAndRelax 4.0.1
 
 - Maintenance and stability improvements.

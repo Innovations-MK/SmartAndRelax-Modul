@@ -5,6 +5,14 @@ void CIO_6W::handleToggles()
 {
     sButton_queue_item item;
     _handleButtonQ();
+
+                                                                              
+                                                                               
+                                                                              
+                                                             
+    const bool physicalTargetInput = cio_toggles.up_pressed || cio_toggles.down_pressed;
+    if(physicalTargetInput) _preemptAutomaticTargetQueueForPhysicalInput();
+
     if(_button_que_len > 30) return;
                                                                                          
                                                                                                                           
@@ -116,7 +124,10 @@ void CIO_6W::handleToggles()
         _qButton(item);
     }
 
-    if((cio_toggles.target != cio_states.target) && (_button_que_len == 0))
+    // Physical panel input has priority. Do not start/restart an automatic
+    // SETTARGET UP/DOWN sequence in the same loop in which the user presses
+    // UP or DOWN on the pump itself.
+    if(!physicalTargetInput && (cio_toggles.target != cio_states.target) && (_button_que_len == 0))
     {
         unlock();
         Buttons dir;
@@ -162,6 +173,11 @@ void CIO_6W::handleToggles()
         item.value = 0xFF;
         item.duration_ms = 100;
         _qButton(item);
+        // TouchFast1: do not wait for the next BWC loop before presenting a
+        // freshly detected physical temperature button to the CIO.
+        _handleButtonQ();
+        physical_target_immediate_start_count++;
+        return;
     }
 
     if((cio_toggles.down_pressed) && (_button_que_len == 0))
@@ -172,6 +188,11 @@ void CIO_6W::handleToggles()
         item.value = 0xFF;
         item.duration_ms = 100;
         _qButton(item);
+        // Same-loop start for physical DOWN. This removes one complete main
+        // loop of avoidable latency while retaining the existing 100 ms pulse.
+        _handleButtonQ();
+        physical_target_immediate_start_count++;
+        return;
     }
 
     // _pressed_button = cio_toggles.pressed_button; TODO: remove variable from class
@@ -210,6 +231,29 @@ void CIO_6W::unlock()
         item.duration_ms = 5000;
         _qButton(item);
     }
+}
+
+
+bool CIO_6W::_preemptAutomaticTargetQueueForPhysicalInput()
+{
+    if(_button_que_len == 0) return false;
+
+    const uint16_t noButtonCode = getButtonCode(NOBTN);
+    const bool activeTargetStep = (_button_que[0].p_state == &sStates::target);
+    // In CIO_6W the only queued NOBTN items are the release gaps appended to
+    // automatic target-temperature sequences. If such a gap is still active,
+    // a physical UP/DOWN press should not have to wait another 400/500 ms.
+    const bool activeTargetRelease = (_button_que[0].btncode == noButtonCode);
+
+    if(!activeTargetStep && !activeTargetRelease) return false;
+
+    _button_que_len = 0;
+    physical_target_preempt_count++;
+
+    uint8_t waitlimit = 0;
+    while(_packet_transm_active && ++waitlimit < 10) delay(1);
+    _button_code = noButtonCode;
+    return true;
 }
 
 void CIO_6W::_noteTargetButtonActivity(bool new_press)

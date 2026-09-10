@@ -6,6 +6,7 @@
 class DSP_2021_HJT : public DSP_6_TYPE1 
 {
     public:
+        DSP_2021_HJT() { _button_poll_interval_ms = 30; }
         String getModel() {return _MYMODEL;};
         Buttons buttonCodeToIndex(uint16_t code);
         bool getHasjets() {return _HASJETS;};

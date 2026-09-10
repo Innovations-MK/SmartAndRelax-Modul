@@ -28,6 +28,7 @@ class CIO_6W : public CIO
         void _qButton(sButton_queue_item item);
         void _handleButtonQ(void);
         void unlock();
+        bool _preemptAutomaticTargetQueueForPhysicalInput();
 
         // 6-wire pumps do not expose target temperature as a separate field.
         // The target is shown on the three display digits for a short period
