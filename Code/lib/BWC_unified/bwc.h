@@ -238,6 +238,7 @@ class BWC {
         uint8_t _web_target = 20; 
         bool _scroll = false;
         bool _audio_enabled;
+        bool _simple_sixwire_beep = false; // PRE2021/MIAMI2021/MALDIVES2021: use robust single beep for physical confirmation sounds
         bool _restore_states_on_start = false;
         bool _save_settings_needed = false;
         bool _save_cmdq_needed = false;

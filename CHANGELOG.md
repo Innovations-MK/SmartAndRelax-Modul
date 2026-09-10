@@ -1,5 +1,10 @@
 # Changelog
 
+## SmartAndRelax 4.0.3
+
+- Unified physical button handling and improved lock operation.
+- Consistent confirmation sounds and further compatibility improvements.
+
 ## SmartAndRelax 4.0.2
 
 - Pump communication, target-temperature and display improvements.

@@ -313,7 +313,7 @@ static const uint32_t PRESENCE_MQTT_FRESH_MAX_AGE_MS = 180000UL;
 
 
                                                       
-static const char* SAR_BUILD_ID = "Phase15-Harden4-TargetGuardFix1-TouchFast1-AutoLockSafe-ShortChain8884Test";
+static const char* SAR_BUILD_ID = "Phase15-Harden4-TargetGuardFix1-Unified6W-NoHold1-LockHold1-Beep1-ShortChain8884Test";
 static String g_boot_diag;
 static uint32_t g_boot_millis = 0;
 static uint32_t g_boot_id = 0;
@@ -908,7 +908,7 @@ static bool sarMigrationStartSession()
     }
 
     StaticJsonDocument<192> requestDoc;
-    requestDoc[F("protocol")] = 1;
+    requestDoc[F("protocol")] = 2;
     requestDoc[F("deviceId")] = getMacClean();
     requestDoc[F("deviceToken")] = sarMigrationToken;
 
@@ -1010,7 +1010,7 @@ static bool sarMigrationPollSession()
         !sarMigrationIsHex64(sarMigrationToken)) return false;
 
     StaticJsonDocument<224> requestDoc;
-    requestDoc[F("protocol")] = 1;
+    requestDoc[F("protocol")] = 2;
     requestDoc[F("sessionId")] = sarMigrationSessionId;
     requestDoc[F("deviceToken")] = sarMigrationToken;
 

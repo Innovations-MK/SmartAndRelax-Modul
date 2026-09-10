@@ -1,11 +1,11 @@
 #include "DSP_6W.h"
 
-    
+    /*getbutton and make states from that*/
 void DSP_6W::updateToggles()
 {
     Buttons btn = getPressedButton();
     dsp_toggles.pressed_button = btn;
-    
+    /*Reset all fields*/
     dsp_toggles.bubbles_change = 0;
     dsp_toggles.heat_change = 0;
     dsp_toggles.jets_change = 0;
@@ -23,7 +23,7 @@ void DSP_6W::updateToggles()
     {
         if(dsp_states.power && !dsp_states.locked)
         {
-            
+            /*Pump is ON and UNLOCKED*/
             switch(btn)
             {
                 case LOCK:
@@ -64,7 +64,7 @@ void DSP_6W::updateToggles()
         }
         else
         {
-            
+            /*Pump is LOCKED or OFF*/
             switch(btn)
             {
                 case POWER:
@@ -80,7 +80,7 @@ void DSP_6W::updateToggles()
         }
     }
     else
-    
+    /*no change in button pressed*/
     {
         switch(btn)
         {
@@ -90,19 +90,18 @@ void DSP_6W::updateToggles()
             case TIMER:
                 dsp_toggles.timer_pressed = 1;
                 break;
-            case UP:
-                dsp_toggles.up_pressed = 1;
-                break;
-            case DOWN:
-                dsp_toggles.down_pressed = 1;
-                break;
+                                                                  
+                                                                               
+                                                                               
+                                                                               
+                                                                                   
             default:
                 break;
         }
     }
     _prev_btn = btn;
 
-    
+    /* Filter enabled buttons */
     dsp_toggles.locked_pressed &= EnabledButtons[LOCK];
     dsp_toggles.timer_pressed &= EnabledButtons[TIMER];
     dsp_toggles.bubbles_change &= EnabledButtons[BUBBLES];

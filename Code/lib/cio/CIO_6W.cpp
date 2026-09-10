@@ -5,14 +5,6 @@ void CIO_6W::handleToggles()
 {
     sButton_queue_item item;
     _handleButtonQ();
-
-                                                                              
-                                                                               
-                                                                              
-                                                             
-    const bool physicalTargetInput = cio_toggles.up_pressed || cio_toggles.down_pressed;
-    if(physicalTargetInput) _preemptAutomaticTargetQueueForPhysicalInput();
-
     if(_button_que_len > 30) return;
                                                                                          
                                                                                                                           
@@ -41,17 +33,28 @@ void CIO_6W::handleToggles()
         return;
     }
 
-    if(cio_toggles.locked_pressed && (_button_que_len == 0))
+    // LockHold1: forward one physical panel LOCK press as one continuous
+    // hold. The old 100 ms chunking inserted small release gaps between
+    // chunks, which can make the pump miss the long-press unlock gesture.
+    // Do not start another hold until the real panel button was released.
+    if(cio_toggles.locked_pressed &&
+       (cio_toggles.pressed_button == LOCK) &&
+       !_physical_lock_hold_active &&
+       !_physical_lock_wait_release &&
+       (_button_que_len == 0))
     {
         item.btncode = getButtonCode(LOCK);
-        // Physical button passthrough: the DSP keeps this flag asserted while
-        // the user holds LOCK, therefore 100 ms chunks are intentional here.
         item.p_state = &sStates::char1;
         item.value = 0xFF;
-        item.duration_ms = 100;
+        item.duration_ms = 5000; // safety ceiling; release ends it earlier
         _qButton(item);
+        _physical_lock_hold_active = true;
         return;
     }
+
+    // Once the physical button is up, a later press may start a new hold.
+    if((cio_toggles.pressed_button != LOCK) && !_physical_lock_hold_active)
+        _physical_lock_wait_release = false;
 
     // if(requestedStates.unit != _requested_states.unit)
     if(cio_toggles.unit_change)
@@ -124,10 +127,7 @@ void CIO_6W::handleToggles()
         _qButton(item);
     }
 
-    // Physical panel input has priority. Do not start/restart an automatic
-    // SETTARGET UP/DOWN sequence in the same loop in which the user presses
-    // UP or DOWN on the pump itself.
-    if(!physicalTargetInput && (cio_toggles.target != cio_states.target) && (_button_que_len == 0))
+    if((cio_toggles.target != cio_states.target) && (_button_que_len == 0))
     {
         unlock();
         Buttons dir;
@@ -173,11 +173,6 @@ void CIO_6W::handleToggles()
         item.value = 0xFF;
         item.duration_ms = 100;
         _qButton(item);
-        // TouchFast1: do not wait for the next BWC loop before presenting a
-        // freshly detected physical temperature button to the CIO.
-        _handleButtonQ();
-        physical_target_immediate_start_count++;
-        return;
     }
 
     if((cio_toggles.down_pressed) && (_button_que_len == 0))
@@ -188,11 +183,6 @@ void CIO_6W::handleToggles()
         item.value = 0xFF;
         item.duration_ms = 100;
         _qButton(item);
-        // Same-loop start for physical DOWN. This removes one complete main
-        // loop of avoidable latency while retaining the existing 100 ms pulse.
-        _handleButtonQ();
-        physical_target_immediate_start_count++;
-        return;
     }
 
     // _pressed_button = cio_toggles.pressed_button; TODO: remove variable from class
@@ -231,29 +221,6 @@ void CIO_6W::unlock()
         item.duration_ms = 5000;
         _qButton(item);
     }
-}
-
-
-bool CIO_6W::_preemptAutomaticTargetQueueForPhysicalInput()
-{
-    if(_button_que_len == 0) return false;
-
-    const uint16_t noButtonCode = getButtonCode(NOBTN);
-    const bool activeTargetStep = (_button_que[0].p_state == &sStates::target);
-    // In CIO_6W the only queued NOBTN items are the release gaps appended to
-    // automatic target-temperature sequences. If such a gap is still active,
-    // a physical UP/DOWN press should not have to wait another 400/500 ms.
-    const bool activeTargetRelease = (_button_que[0].btncode == noButtonCode);
-
-    if(!activeTargetStep && !activeTargetRelease) return false;
-
-    _button_que_len = 0;
-    physical_target_preempt_count++;
-
-    uint8_t waitlimit = 0;
-    while(_packet_transm_active && ++waitlimit < 10) delay(1);
-    _button_code = noButtonCode;
-    return true;
 }
 
 void CIO_6W::_noteTargetButtonActivity(bool new_press)
@@ -320,6 +287,38 @@ void CIO_6W::_handleButtonQ(void) {
     elapsedTime = millis() - prevMillis;
     prevMillis = millis();
     uint8_t waitlimit = 0;
+
+                                                                         
+                                                                  
+    if(_physical_lock_hold_active && (_button_que_len == 0))
+    {
+        _physical_lock_hold_active = false;
+        _physical_lock_wait_release = (cio_toggles.pressed_button == LOCK);
+    }
+
+                                                                          
+                                                                            
+                                                                           
+                                                                        
+    if(_physical_lock_hold_active &&
+       (_button_que_len > 0) &&
+       (cio_toggles.pressed_button != LOCK))
+    {
+        for(int i = 0; i < _button_que_len-1; i++){
+            _button_que[i].btncode = _button_que[i+1].btncode;
+            _button_que[i].p_state = _button_que[i+1].p_state;
+            _button_que[i].value = _button_que[i+1].value;
+            _button_que[i].duration_ms = _button_que[i+1].duration_ms;
+        }
+        _button_que_len--;
+        _physical_lock_hold_active = false;
+        _physical_lock_wait_release = false;
+        waitlimit = 0;
+        while(_packet_transm_active && ++waitlimit < 10) delay(1);
+        _button_code = getButtonCode(NOBTN);
+        return;
+    }
+
     if(_button_que_len == 0)
     // {
     //     /*Buttonqueue is empty, so let the touchbuttons from display/bwc through*/
@@ -344,6 +343,11 @@ void CIO_6W::_handleButtonQ(void) {
         // that became satisfied meanwhile), discard it without pressing.
         if(cio_states.*_button_que[0].p_state == _button_que[0].value)
         {
+            if(_physical_lock_hold_active)
+            {
+                _physical_lock_hold_active = false;
+                _physical_lock_wait_release = (cio_toggles.pressed_button == LOCK);
+            }
             for(int i = 0; i < _button_que_len-1; i++){
                 _button_que[i].btncode = _button_que[i+1].btncode;
                 _button_que[i].p_state = _button_que[i+1].p_state;
@@ -373,6 +377,14 @@ void CIO_6W::_handleButtonQ(void) {
     //check if state is as desired, or duration is up. If so - remove row. Else set BTNCODE
     if( (cio_states.*_button_que[0].p_state == _button_que[0].value) || (_button_que[0].duration_ms <= 0) )
     {
+        // If the physical LOCK safety ceiling is reached while the user is
+        // still holding the button, do not immediately enqueue another hold.
+        // A release is required before the next physical LOCK operation.
+        if(_physical_lock_hold_active)
+        {
+            _physical_lock_hold_active = false;
+            _physical_lock_wait_release = (cio_toggles.pressed_button == LOCK);
+        }
         //remove row
         for(int i = 0; i < _button_que_len-1; i++){
             _button_que[i].btncode = _button_que[i+1].btncode;

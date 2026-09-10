@@ -1059,6 +1059,14 @@ void BWC::setup(void){
     }
     cio->setup(pins[0], pins[1], pins[2]);
 
+    // Keep the three Type1/6-wire panel families acoustically consistent.
+    // Use the instantiated model name here so the audio choice does not depend
+    // on any transient/uninitialized hardware-selection variable.
+    {
+        const String model = cio->getModel();
+        _simple_sixwire_beep = (model == F("PRE2021") || model == F("MIAMI2021") || model == F("MALDIVES2021"));
+    }
+
     cio->setPowerLevels(power_levels);
     
     dsp->setup(pins[3], pins[4], pins[5], pins[6]);
@@ -1271,8 +1279,11 @@ void BWC::play_sound()
         dsp->dsp_toggles.bubbles_change || dsp->dsp_toggles.heat_change || 
         dsp->dsp_toggles.jets_change    || dsp->dsp_toggles.power_change || 
         dsp->dsp_toggles.pump_change    || dsp->dsp_toggles.unit_change
-    ) 
-        _accord();
+    )
+    {
+        if(_simple_sixwire_beep) _beep();
+        else _accord();
+    }
     /* Lock button sound is taken care of in _handleStateChanges() */
 }
 

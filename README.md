@@ -13,7 +13,7 @@ The complete license text is available in the `LICENSE` file.
 
 The source code for SmartAndRelax is provided in this repository.
 
-This source release is **4.0.2**. Earlier versions are available through their corresponding release archives and Git tags.
+This source release is **4.0.3**. Earlier versions are available through their corresponding release archives and Git tags.
 
 For release-specific changes and dates, see `CHANGELOG.md`, the Git history and the corresponding GitHub releases. Additional copyright and attribution information is available in `NOTICE.md`.
 
