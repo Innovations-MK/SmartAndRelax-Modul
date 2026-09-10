@@ -1,5 +1,10 @@
 # Changelog
 
+## SmartAndRelax 4.0.1
+
+- Maintenance and stability improvements.
+- Updated build support and firmware version.
+
 ## SmartAndRelax 4.0.0
 
 - Initial 4.x public source release.

@@ -360,7 +360,8 @@ var connection;
                                               
 var pollTimer = null;
 function isPollingMode(){
-  return localStorage.getItem('usePolling') === 'true';
+                                                               
+  return true;
 }
 
 function startPolling(){
@@ -387,23 +388,12 @@ function startPolling(){
   }
 
   pollOnce();
-  pollTimer = setInterval(pollOnce, 1000);
+  pollTimer = setInterval(pollOnce, 2000);
   console.log('Transport: POLLING');
 }
 
 function startTransport(){
-  if(isPollingMode()){
-    startPolling();
-    return;
-  }
-  connect();
-                                                                                     
-  setTimeout(function(){
-    if(!document.body.classList.contains('connected')){
-      console.warn('WS connect timeout -> fallback to polling');
-      startPolling();
-    }
-  }, 2500);
+  startPolling();
 }
 
 
@@ -688,6 +678,20 @@ function s2dhms(val) {
   return days + "d " + hours.toString().pad("0", 2) + ":" + minutes.toString().pad("0", 2) + ":" + seconds.toString().pad("0", 2);
 }
 
+function pollOnceSafeAfterCommand(){
+  var req = new XMLHttpRequest();
+  req.open('GET', '/wsstate/?_=' + Date.now(), true);
+  req.onreadystatechange = function(){
+    if(this.readyState === 4 && this.status === 200){
+      try{
+        var arr = JSON.parse(this.responseText);
+        if(Array.isArray(arr)) arr.forEach(function(o){ handlemsg({data: JSON.stringify(o)}); });
+      }catch(e){}
+    }
+  };
+  req.send();
+}
+
 function sendCommand(cmd) {
   console.log(cmd);
   console.log(typeof cmdMap[cmd]);
@@ -741,6 +745,7 @@ function sendCommand(cmd) {
     req.open('POST', '/addcommand/', true);
     req.setRequestHeader('Content-Type', 'application/json');
     req.send(json);
+    setTimeout(pollOnceSafeAfterCommand, 120);
   } else {
     if (connection && connection.readyState === 1) {
       connection.send(json);

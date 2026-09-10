@@ -29,6 +29,18 @@ class CIO_6W : public CIO
         void _handleButtonQ(void);
         void unlock();
 
+        // 6-wire pumps do not expose target temperature as a separate field.
+        // The target is shown on the three display digits for a short period
+        // after UP/DOWN. In 4.x the main loop can occasionally be delayed, so
+        // target recognition must not depend on updateStates() happening while
+        // _button_code is still physically asserted.
+        static constexpr uint32_t TARGET_CAPTURE_MS = 2200UL;
+        static constexpr uint32_t TARGET_UNCERTAIN_MS = 6000UL;
+        void _noteTargetButtonActivity(bool new_press);
+        uint32_t _targetCaptureAgeMs() const;
+        int _parseDisplayNumber(char c1, char c2, char c3) const;
+        bool _acceptTargetValue(int value);
+
     public:
         uint8_t brightness;
 

@@ -9,18 +9,26 @@ static void sarCloudV2MigrationClearState();
 static void sarCloudV2MigrationTick();
 static void sarPrepareFreshV2PairingAfterMigration();
 
-
+                                                                
 static uint32_t mqtt_next_telemetry_ms = 0;
 static bool mqtt_telemetry_enabled = false;
 
-
+                                                                            
+                                                                             
 static uint32_t cloud_next_mqtt_try_ms = 0;
 
 static void writeRestartMarker(const String& reason);
+static void requestRestart(const char* reason);
+#if defined(ESP8266)
+static void cloudTlsStopBounded(bool gracefulMqttDisconnect, const char* reason);
+#endif
 bool setupHAStage(uint8_t stage);
 static void publishStatusRetained(const char* status);
 
-
+                                                       
+                                                                          
+                                                                              
+                                                                              
 static void cloudV2ResponseTick();
 static bool cloud_v2_publish_telemetry_pending = false;
 static bool cloud_v2_publish_times_pending = false;
@@ -68,19 +76,32 @@ static bool mqttPublishChecked(const String& topic, const char* payload, bool re
     return true;
 }
 
-
+                                                                                                
+                                                                                                                               
+                                                                                                                       
 static uint32_t heap_guard_last_check_ms = 0;
 static uint32_t low_heap_since_ms       = 0;
 static uint32_t heap_guard_restarts     = 0;
 static uint32_t min_heap_seen           = 0xFFFFFFFFUL;
 static uint32_t min_maxblock_seen       = 0xFFFFFFFFUL;
+                                                                              
+                                                                             
+                                                                              
+                                                                          
+static const uint32_t HEAP_GUARD_IDLE_MIN_HEAP  = 10000UL;
+static const uint32_t HEAP_GUARD_IDLE_MIN_BLOCK = 5000UL;
+static const uint32_t HEAP_GUARD_TLS_MIN_HEAP   = 6500UL;
+static const uint32_t HEAP_GUARD_TLS_MIN_BLOCK  = 4000UL;
+static bool     heap_guard_tls_runtime_mode     = false;
+static uint32_t heap_guard_current_heap_limit   = HEAP_GUARD_IDLE_MIN_HEAP;
+static uint32_t heap_guard_current_block_limit  = HEAP_GUARD_IDLE_MIN_BLOCK;
 
 static void heapGuardTick(uint32_t now_ms)
 {
-    
+                                        
     if (now_ms < 120000UL) return;
 
-    
+                                    
     if ((uint32_t)(now_ms - heap_guard_last_check_ms) < 5000UL) return;
     heap_guard_last_check_ms = now_ms;
 
@@ -90,45 +111,59 @@ static void heapGuardTick(uint32_t now_ms)
     if (fh < min_heap_seen)     min_heap_seen = fh;
     if (mb < min_maxblock_seen) min_maxblock_seen = mb;
 
-    
-    const bool low = (fh < 10000UL) || (mb < 5000UL);
+                                                                             
+                                                                           
+                                                                                
+    heap_guard_tls_runtime_mode = mqttCloudMode && mqttClient &&
+                                  (mqttClient->state() == MQTT_CONNECTED);
+    heap_guard_current_heap_limit = heap_guard_tls_runtime_mode
+                                      ? HEAP_GUARD_TLS_MIN_HEAP
+                                      : HEAP_GUARD_IDLE_MIN_HEAP;
+    heap_guard_current_block_limit = heap_guard_tls_runtime_mode
+                                       ? HEAP_GUARD_TLS_MIN_BLOCK
+                                       : HEAP_GUARD_IDLE_MIN_BLOCK;
+    const bool low = (fh < heap_guard_current_heap_limit) ||
+                     (mb < heap_guard_current_block_limit);
 
     if (low) {
         if (low_heap_since_ms == 0) low_heap_since_ms = now_ms;
 
-        
+                                                                                       
         if ((uint32_t)(now_ms - low_heap_since_ms) > 20UL * 60UL * 1000UL) {
             heap_guard_restarts++;
 
-            
-            writeRestartMarker(String(F("LOW_HEAP fh=")) + fh + F(" mb=") + mb);
+            const String restartReason = String(F("LOW_HEAP fh=")) + fh + F(" mb=") + mb;
 
-            
-            if (mqttClient && mqttClient->connected()) {
-                mqttClient->disconnect();
-            }
-            if (aWifiClient) {
-                aWifiClient->stop();
-            }
+                                                                           
+                                                                              
+                                                                                 
+#if defined(ESP8266)
+            if (mqttCloudMode) cloudTlsStopBounded(false, "heap-guard");
+            else if (aWifiClient) aWifiClient->stop();
+#else
+            if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+            if (aWifiClient) aWifiClient->stop();
+#endif
 
-            delay(50);
-            ESP.restart();
+            requestRestart(restartReason.c_str());
         }
     } else {
         low_heap_since_ms = 0;
     }
 }
 
-
+                                                                                  
 static bool     custom_mqtt_kick = false;
 static uint32_t custom_mqtt_kick_at_ms = 0;
 
-
+                                                    
+                                                                                    
+                                                                                     
 static bool     custom_ha_discovery_pending = false;
 static bool     custom_ha_discovery_sent = false;
 static uint8_t  custom_ha_discovery_stage = 0;
 static uint32_t custom_ha_discovery_due_ms = 0;
-static bool     mqtt_ha_discovery_active = false;  
+static bool     mqtt_ha_discovery_active = false;                                                                 
 
 static void resetCustomHaDiscoverySchedule()
 {
@@ -198,8 +233,8 @@ static void customHaDiscoveryTick()
         {
             sendMQTT();
             mqttClient->loop();
-            
-            
+                                                                                           
+                                                        
             if (!mqttCloudMode) {
                 uint32_t telemetryIntervalMs = (uint32_t)mqttTelemetryInterval * 1000UL;
                 if (telemetryIntervalMs < 60000UL) telemetryIntervalMs = 60000UL;
@@ -261,22 +296,44 @@ static void customHaDiscoveryTick()
     }
 }
 
-
+                                                                                           
 static uint32_t presence_last_attempt_ms = 0;
 static uint32_t presence_last_ok_ms      = 0;
 static uint32_t presence_stall_count     = 0;
 static uint32_t presence_force_poll_ms   = 0;
 static uint32_t presence_last_stall_rearm_ms = 0;
 
+                                                                        
+static const uint32_t PRESENCE_NO_ATTEMPT_REARM_MS = 120000UL;                                                     
+static const uint32_t PRESENCE_NO_OK_STALL_MS      = 900000UL;                                                      
+static const uint32_t MQTT_BACKOFF_ON_STALL_MS     = 600000UL;                                                         
+static const uint32_t PRESENCE_MQTT_FRESH_MAX_AGE_MS = 180000UL;                                                           
 
-static const uint32_t PRESENCE_NO_ATTEMPT_REARM_MS = 120000UL;    
-static const uint32_t PRESENCE_NO_OK_STALL_MS      = 900000UL;    
-static const uint32_t MQTT_BACKOFF_ON_STALL_MS     = 600000UL;    
-static const uint32_t PRESENCE_MQTT_FRESH_MAX_AGE_MS = 180000UL;  
 
 
+                                                      
+static const char* SAR_BUILD_ID = "Phase15-Harden4";
 static String g_boot_diag;
 static uint32_t g_boot_millis = 0;
+static uint32_t g_boot_id = 0;
+static uint32_t g_boot_heap_initial = 0;
+static uint32_t g_boot_block_initial = 0;
+static uint8_t  g_boot_frag_initial = 0;
+
+                                                                      
+                                                                            
+                                                                            
+                                                                   
+static const bool SAR_LOCAL_WEBSOCKET_ENABLED = false;
+static uint32_t http_file_serve_count = 0;
+static uint32_t http_file_abort_count = 0;
+static uint32_t http_file_write_stall_count = 0;
+static uint32_t http_file_last_duration_ms = 0;
+static uint32_t http_file_max_duration_ms = 0;
+static uint32_t http_file_max_no_progress_ms = 0;
+static char http_file_last_path[64] = {0};
+static uint32_t wsstate_request_count = 0;
+static uint32_t wsstate_low_heap_defer_count = 0;
 
 static String htmlEscape(const String& in) {
     String out;
@@ -295,15 +352,16 @@ static String htmlEscape(const String& in) {
 }
 
 
+                                                            
 static const char* kRestartMarkerPath = "/last_restart_marker.txt";
 static String g_last_restart_marker_boot;
 
 static void writeRestartMarker(const String& reason) {
-    
+                                                                                    
     File f = LittleFS.open(kRestartMarkerPath, "w");
     if (!f) return;
 
-    
+                                                                                 
     f.print("Reason: ");
     f.println(reason);
 
@@ -327,57 +385,152 @@ static void loadRestartMarkerBoot() {
     if (!f) return;
     g_last_restart_marker_boot = f.readString();
     f.close();
+
+                                                                               
+                                                                            
+                                                                                
+                                                  
+    LittleFS.remove(kRestartMarkerPath);
 }
 
 static void requestRestart(const char* reason) {
-    
+                                          
     String r = reason ? String(reason) : String("unknown");
     writeRestartMarker(r);
     delay(50);
     ESP.restart();
 }
 
+                                                                            
+                                                                       
+void sarMarkedRestart(const char* reason)
+{
+    requestRestart(reason ? reason : "library restart");
+}
+
+
 
 #if defined(ESP8266)
- #include <bearssl/bearssl.h>   
+ #ifndef SAR_BEARSSL_TIMEOUT_PATCH
+  #error "Phase15-Harden3 requires patch_bearssl_timeout.py (timeout preservation patch missing)"
+ #endif
+ #ifndef SAR_BEARSSL_SERVICE_HOOK_PATCH
+  #error "Phase15-Harden3 requires patch_bearssl_timeout.py (pump service hook patch missing)"
+ #endif
+ #include <bearssl/bearssl.h>                
  extern "C" {
-  #include <user_interface.h>  
+  #include <user_interface.h>                                      
  }
 
- 
- 
- 
- static BearSSL::WiFiClientSecure tlsClientStatic;
- static BearSSL::X509List         tlsCaStatic(SAR_MQTT_CA_CERT);
+                                  
+                                                             
+   
+                                                                          
+                                                                           
+                                                                              
+                                                                                
+                                                                
+                                  
+ static volatile bool sar_cloud_tls_handshake_in_progress = false;
+ static uint32_t sar_tls_pump_service_count = 0;
+ static uint32_t sar_tls_pump_service_last_ms = 0;
+ static uint32_t sar_tls_pump_service_max_gap_ms = 0;
 
- 
- static WiFiClient                wifiClientPlainStatic;
+ class SarCloudTlsClient : public BearSSL::WiFiClientSecureCtx
+ {
+ public:
+     int connectTcpOnly(const IPAddress& ip, uint16_t port, uint32_t timeoutMs)
+     {
+         setTimeout(timeoutMs);
+         return WiFiClient::connect(ip, port);
+     }
 
- 
- BearSSL::WiFiClientSecure *tlsClient = &tlsClientStatic;
- BearSSL::X509List         *tlsCa     = &tlsCaStatic;
+     bool startTlsOnly(const char* hostName, uint32_t timeoutMs)
+     {
+                                                                            
+                                                                                
+                                                                              
+                                                             
+         setTimeout(timeoutMs);
+         sar_cloud_tls_handshake_in_progress = true;
+         const bool ok = _connectSSL(hostName);
+         sar_cloud_tls_handshake_in_progress = false;
+         return ok;
+     }
+
+     bool tcpConnectedOnly()
+     {
+         return WiFiClient::connected();
+     }
+ };
+
+ static SarCloudTlsClient          tlsClientStatic;
+ static BearSSL::X509List          tlsCaStatic(SAR_MQTT_CA_CERT);
+ static BearSSL::Session           mqttTlsSessionStatic;
+
+                                                               
+ static WiFiClient                 wifiClientPlainStatic;
+
+                           
+ BearSSL::WiFiClientSecureCtx *tlsClient = &tlsClientStatic;
+ BearSSL::X509List            *tlsCa     = &tlsCaStatic;
+
+ static void generateBootId()
+ {
+     os_get_random(reinterpret_cast<unsigned char*>(&g_boot_id), sizeof(g_boot_id));
+     if (g_boot_id == 0) g_boot_id = ESP.getChipId() ^ micros() ^ ESP.getCycleCount();
+ }
+
+ static String bootIdString()
+ {
+     char buf[9];
+     snprintf(buf, sizeof(buf), "%08lX", (unsigned long)g_boot_id);
+     return String(buf);
+ }
+
+ static void appendStructuredResetInfo(String& out)
+ {
+     const struct rst_info* ri = system_get_rst_info();
+     if (!ri) {
+         out += F("ResetStruct: unavailable\n");
+         return;
+     }
+
+     char buf[192];
+     snprintf_P(buf, sizeof(buf),
+                PSTR("ResetStructReason: %u\nExceptionCause: %u\nEPC1: 0x%08lX\nEPC2: 0x%08lX\nEPC3: 0x%08lX\nEXCVADDR: 0x%08lX\nDEPC: 0x%08lX\n"),
+                (unsigned)ri->reason,
+                (unsigned)ri->exccause,
+                (unsigned long)ri->epc1,
+                (unsigned long)ri->epc2,
+                (unsigned long)ri->epc3,
+                (unsigned long)ri->excvaddr,
+                (unsigned long)ri->depc);
+     out += buf;
+ }
 #endif
 
-
+                                                                               
 #if defined(ESP8266)
- static PubSubClient mqttClientStatic(wifiClientPlainStatic); 
+ static PubSubClient mqttClientStatic(wifiClientPlainStatic);                  
 #else
  static WiFiClient   wifiClientStatic;
  static PubSubClient mqttClientStatic(wifiClientStatic);
 #endif
 
 
-static bool g_mqtt_last_connect_ok = false; 
+
+
+static bool g_mqtt_last_connect_ok = false;                                                                 
 
 static String getMacClean()
 {
-    String mac = WiFi.macAddress();   
+    String mac = WiFi.macAddress();                         
     mac.replace(":", "");
     mac.replace("-", "");
     mac.toUpperCase();
     return mac;
 }
-
 
 static void sarHandleSerialProvisioning()
 {
@@ -415,15 +568,15 @@ static void sarHandleSerialProvisioning()
                     continue;
                 }
 
-                
-                
-                
+                                                                                         
+                                                                                  
+                                                                                    
                 if (!cloudV2CredentialsLoad()) {
                     Serial.println(F("SARPROV:ERR VERIFY_FAILED"));
                     continue;
                 }
 
-                
+                                                                                       
                 mqttPassword = cloudV2CredentialsSecret();
                 Serial.print(F("SARPROV:OK DEVICE_ID="));
                 Serial.print(getMacClean());
@@ -445,7 +598,9 @@ static void sarHandleSerialProvisioning()
     }
 }
 
-
+                                                                    
+                                                                       
+                                                                         
 static void sarSerialProvisioningBootWindow(uint32_t windowMs)
 {
     if (cloudV2CredentialsProvisioned()) return;
@@ -470,7 +625,7 @@ static void sarSerialProvisioningBootWindow(uint32_t windowMs)
 
 static bool timeLooksValid() {
   time_t now = time(nullptr);
-  return (now > 1700000000); 
+  return (now > 1700000000);                 
 }
 
 static void waitForValidTime(uint32_t maxWaitMs = 8000) {
@@ -482,6 +637,16 @@ static void waitForValidTime(uint32_t maxWaitMs = 8000) {
 }
 
 
+                                                                                
+                                                  
+                                                                                
+                                                                              
+                                                    
+  
+                                                                             
+                                                                                
+                                                              
+                                                                                
 static const char* SAR_MIGRATION_API_URL = SAR_PUBLIC_MIGRATION_API_URL;
 static const char* SAR_MIGRATION_START_PATH = "/api/v2/migration/start";
 static const char* SAR_MIGRATION_POLL_PATH  = "/api/v2/migration/poll";
@@ -614,7 +779,7 @@ static uint32_t sarMigrationBackoffMs(bool rateLimited = false)
     if (rateLimited) return 30UL * 60UL * 1000UL;
 
     uint8_t shift = sarMigrationFailStreak > 6 ? 6 : sarMigrationFailStreak;
-    uint32_t delayMs = 15000UL << shift; 
+    uint32_t delayMs = 15000UL << shift;                       
     if (delayMs > 30UL * 60UL * 1000UL) delayMs = 30UL * 60UL * 1000UL;
     return delayMs;
 }
@@ -652,7 +817,6 @@ static int sarMigrationHttpPost(const char* path, const String& payload, String&
 
     if (WiFi.status() != WL_CONNECTED) return -1;
     if (!timeLooksValid()) return -2;
-    if (!SAR_MIGRATION_API_URL || SAR_MIGRATION_API_URL[0] == '\0') return -3;
 
     sarMigrationTlsClient.stop();
     sarMigrationTlsClient.setTrustAnchors(&tlsCaStatic);
@@ -666,8 +830,8 @@ static int sarMigrationHttpPost(const char* path, const String& payload, String&
     url += SAR_MIGRATION_API_URL;
     url += path;
 
-    
-    
+                                                                         
+                                                                          
     struct _SarMigrationHardFreezeGuard {
         bool active = false;
         _SarMigrationHardFreezeGuard() {
@@ -719,8 +883,8 @@ static bool sarMigrationEnsureToken()
         return false;
     }
 
-    
-    
+                                                                               
+                                                         
     if (!sarCloudV2MigrationSaveState()) {
         sarMigrationToken = "";
         return false;
@@ -758,8 +922,8 @@ static bool sarMigrationStartSession()
         }
         Serial.println();
 
-        
-        
+                                                                                
+                                                                                     
         sarMigrationScheduleRetry(code == 429);
         return false;
     }
@@ -808,19 +972,19 @@ static bool sarMigrationSaveReceivedSecret(String& secret)
 
     if (!cloudV2CredentialsSaveSecret(secret)) return false;
 
-    
+                                                            
     if (!cloudV2CredentialsLoad()) return false;
 
     mqttPassword = cloudV2CredentialsSecret();
 
-    
-    
+                                                                               
+                                                              
     sarPrepareFreshV2PairingAfterMigration();
 
-    
+                                                                 
     sarCloudV2MigrationClearState();
 
-    
+                                                                         
     for (uint16_t i = 0; i < secret.length(); i++) secret.setCharAt(i, '0');
     secret = "";
 
@@ -880,8 +1044,8 @@ static bool sarMigrationPollSession()
     status.trim();
 
     if (status == F("completed")) {
-        
-        
+                                                                            
+                                                                 
         Serial.println(F("[CloudV2 MIG] server says completed but local secret is absent"));
         sarMigrationScheduleRetry(true);
         return false;
@@ -928,7 +1092,7 @@ static bool sarMigrationPollSession()
 
 static void sarCloudV2MigrationTick()
 {
-    
+                                                                   
     if (cloudV2CredentialsProvisioned()) {
         if (sarMigrationToken.length() || sarMigrationSessionId.length() ||
             LittleFS.exists(SAR_MIGRATION_STATE_PATH)) {
@@ -937,8 +1101,8 @@ static void sarCloudV2MigrationTick()
         return;
     }
 
-    
-    
+                                                                            
+                                                         
     if (!mqttCloudMode || !useMqtt) return;
     if (WiFi.status() != WL_CONNECTED) return;
 
@@ -966,13 +1130,17 @@ static void sarCloudV2MigrationTick()
 }
 
 
-static const uint32_t PRESENCE_POLL_OFFLINE_MS  = 3UL * 60UL * 1000UL;  
-static const uint32_t PRESENCE_POLL_BURST_MS = 20000UL; 
-static const uint32_t PRESENCE_POLL_ONLINE_MS = 60000UL; 
-static const uint32_t PRESENCE_ACTIVE_WINDOW_MS = 3UL  * 60UL * 1000UL;  
-static const uint32_t PRESENCE_GRACE_MS         = 45UL * 1000UL;         
+                       
+                                    
+                       
+static const uint32_t PRESENCE_POLL_OFFLINE_MS  = 3UL * 60UL * 1000UL;              
+static const uint32_t PRESENCE_POLL_BURST_MS = 20000UL;               
+static const uint32_t PRESENCE_POLL_ONLINE_MS = 60000UL;               
+static const uint32_t PRESENCE_ACTIVE_WINDOW_MS = 3UL  * 60UL * 1000UL;              
+static const uint32_t PRESENCE_GRACE_MS         = 45UL * 1000UL;                       
 
-
+                                   
+                                                     
 static const bool PRESENCE_DEBUG = false;
 static const bool PRESENCE_FORCE_PUBLIC_DNS = true;
 static const IPAddress PRESENCE_DNS_PRIMARY(1, 1, 1, 1);
@@ -1001,7 +1169,8 @@ static String presence_diag_log;
 static String presence_diag_boot;
 static const char* kPresenceDiagPath = "/last_presence_diag.txt";
 
-
+                                            
+                                                                                      
 static uint32_t presence_poll_seq = 0;
 static uint32_t presence_last_poll_start_ms = 0;
 static uint32_t presence_last_poll_duration_ms = 0;
@@ -1025,8 +1194,8 @@ static uint32_t presence_last_frag_end = 0;
 static uint32_t presence_last_bytes_read = 0;
 static int32_t  presence_last_content_len = -1;
 static uint8_t  presence_last_dns_tries = 0;
-static uint8_t  presence_last_tls_mode = 0; 
-static uint8_t  presence_last_outcome = 0;  
+static uint8_t  presence_last_tls_mode = 0;                                 
+static uint8_t  presence_last_outcome = 0;                                                                                                  
 static char     presence_last_stage[18] = "boot";
 static String   presence_crash_marker_boot;
 static const char* kPresenceCrashMarkerPath = "/presence_crash_marker.txt";
@@ -1072,10 +1241,10 @@ static void loadPresenceCrashMarkerBoot()
     presence_crash_marker_boot = f.readString();
     f.close();
 
-    
-    
-    
-    
+                                                                      
+                                                                  
+                                                                        
+                                                      
     if (presence_crash_marker_boot.indexOf(F("stage=tls_host")) >= 0 ||
         presence_crash_marker_boot.indexOf(F("stage=tls_ip")) >= 0 ||
         presence_crash_marker_boot.indexOf(F("stage=tls")) >= 0) {
@@ -1106,13 +1275,14 @@ static void loadPresenceDiagBoot()
 }
 
 
+
 static const char* PRESENCE_HOST = SAR_PUBLIC_PRESENCE_HOST;
 static const uint16_t PRESENCE_PORT = 443;
 static const char* PRESENCE_PATH_PREFIX = "/presence?deviceId=";
 
 static uint32_t presence_active_until_ms = 0;
 
-
+                                            
 #if defined(ESP8266)
 static BearSSL::WiFiClientSecure presenceClient;
 extern const char PRESENCE_ROOT_CA[] PROGMEM;
@@ -1121,6 +1291,12 @@ static BearSSL::X509List* presenceCa = &presenceCaStatic;
 static BearSSL::Session presenceSession;
 
 
+
+
+
+                                                                         
+                                                                                                 
+                                                                        
 const char PRESENCE_ROOT_CA[] PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIFCzCCAvOgAwIBAgIQf/AFoHxM3tEArZ1mpRB7mDANBgkqhkiG9w0BAQsFADBH
@@ -1195,8 +1371,10 @@ static const uint32_t PRESENCE_WAIT_FIRST_BYTE_MS  = 5000UL;
 static const uint32_t PRESENCE_WAIT_STATUS_MS      = 5000UL;
 static const uint32_t PRESENCE_WAIT_HEADER_MS      = 5000UL;
 static const uint32_t PRESENCE_WAIT_BODY_MS        = 5000UL;
-
-
+                                                                                       
+                                                                                
+                                                                        
+                                                                 
 static const uint32_t PRESENCE_HEAP_SKIP_FREE_MS          = 11000UL;
 static const uint32_t PRESENCE_HEAP_SKIP_BLOCK_START_MS   = 5800UL;
 static const uint32_t PRESENCE_HEAP_SKIP_BLOCK_FLOOR_MS   = 5800UL;
@@ -1266,15 +1444,15 @@ static void initPresenceTlsOnce()
     presenceCa = new BearSSL::X509List(PRESENCE_ROOT_CA);
   }
 
-  
+                             
   waitForValidTime(8000);
 
-  presenceClient.setTrustAnchors(presenceCa);   
-  presenceClient.setSession(&presenceSession);  
+  presenceClient.setTrustAnchors(presenceCa);             
+  presenceClient.setSession(&presenceSession);                              
   presenceClient.setTimeout((int)(PRESENCE_TLS_TIMEOUT_MS / 1000UL));
   presenceClient.setX509Time(time(nullptr));
 
-  
+                                                                                            
   if (!presenceMflnProbed) {
     presenceMflnProbed = true;
     presenceMflnOk = presenceClient.probeMaxFragmentLength(PRESENCE_HOST, PRESENCE_PORT, 1024);
@@ -1304,26 +1482,54 @@ static void initPresenceTlsOnce()
 #endif
 
 
+
 static uint32_t presence_next_poll_ms = 0;
 static uint32_t presence_grace_until_ms = 0;
 static bool     presence_allowed = false;
 
-
+                                                                       
 static uint32_t cloud_pair_bootstrap_until_ms = 0;
 
 #if defined(ESP8266)
-
+                                          
 static uint32_t mqtt_last_connected_ms = 0;
 static uint32_t mqtt_last_attempt_ms   = 0;
 static uint8_t  mqtt_fail_streak       = 0;
 static uint32_t mqtt_stack_reset_ms    = 0;
 
-
+                                                                              
 static uint32_t wifi_got_ip_count = 0;
 static uint32_t wifi_disconnect_count = 0;
 static uint32_t wifi_last_got_ip_ms = 0;
 static uint32_t wifi_last_disconnect_ms = 0;
 static uint8_t  wifi_last_disconnect_reason = 0;
+static uint32_t got_ip_heap_before = 0;
+static uint32_t got_ip_heap_after = 0;
+static int32_t  got_ip_heap_delta = 0;
+static uint32_t got_ip_block_before = 0;
+static uint32_t got_ip_block_after = 0;
+static int32_t  got_ip_block_delta = 0;
+static uint32_t http_init_count = 0;
+static uint32_t http_reuse_count = 0;
+static uint32_t ws_init_count = 0;
+static uint32_t ws_reuse_count = 0;
+static uint32_t mqtt_init_count = 0;
+static uint32_t mqtt_reconfigure_count = 0;
+static bool     mqtt_stack_initialized = false;
+static uint32_t tls_admission_blocked_count = 0;
+static uint32_t tls_admission_last_heap = 0;
+static uint32_t tls_admission_last_block = 0;
+static uint32_t tls_reclaim_count = 0;
+static uint32_t tls_reclaim_heap_before = 0;
+static uint32_t tls_reclaim_heap_after = 0;
+static uint32_t tls_reclaim_block_before = 0;
+static uint32_t tls_reclaim_block_after = 0;
+static uint32_t tls_time_deferred_count = 0;
+static uint32_t mqtt_last_connect_duration_ms = 0;
+static uint32_t mqtt_last_connect_heap_before = 0;
+static uint32_t mqtt_last_connect_heap_after = 0;
+static uint32_t mqtt_last_connect_block_before = 0;
+static uint32_t mqtt_last_connect_block_after = 0;
 static uint32_t mqtt_connect_attempt_count = 0;
 static uint32_t mqtt_connect_success_count = 0;
 static uint32_t mqtt_connect_fail_count = 0;
@@ -1332,14 +1538,146 @@ static uint32_t mqtt_loop_drop_count = 0;
 static uint32_t mqtt_last_loop_drop_ms = 0;
 static int      mqtt_last_loop_drop_state = 999;
 static const char* mqtt_last_connect_trigger = "boot";
+
+                                                                              
+                                                                                
+                                                                               
+                                                                          
+                                                                            
+                                                                 
+static const uint32_t SAR_CLOUD_TCP_STAGE_TIMEOUT_MS  = 1800UL;
+static const uint32_t SAR_MQTT_TLS_CONNECT_TIMEOUT_MS = 8000UL;
+static const uint32_t SAR_MQTT_TLS_STOP_TIMEOUT_MS    = 250UL;
+static const uint32_t SAR_MQTT_TLS_RUNTIME_TIMEOUT_MS = 1000UL;
+static const uint16_t SAR_MQTT_CONNACK_TIMEOUT_S      = 2U;
+static const uint32_t SAR_MQTT_STAGE_GAP_MS           = 25UL;
+static const uint32_t SAR_CLOUD_DNS_STAGE_TIMEOUT_MS  = 1500UL;
+static const uint32_t SAR_CLOUD_DNS_CACHE_VALID_MS        = 60000UL;
+static const uint32_t SAR_TLS_ADMISSION_MIN_HEAP      = 12000UL;
+static const uint32_t SAR_TLS_ADMISSION_MIN_BLOCK     = 7000UL;
+static const uint32_t SAR_TLS_ADMISSION_RETRY_MS      = 30000UL;
+static const uint32_t SAR_TLS_ADMISSION_RECOVERY_MS   = 5UL * 60UL * 1000UL;
+static const uint32_t SAR_MQTT_SLOW_CONNECT_MS        = 3000UL;
+
+static uint32_t tls_admission_blocked_since_ms = 0;
+static uint32_t tls_admission_last_blocked_ms = 0;
+static uint32_t tls_admission_recovery_restarts = 0;
+static uint32_t mqtt_tls_timeout_reapply_count = 0;
+static uint32_t mqtt_tls_stop_count = 0;
+static uint32_t mqtt_tls_last_stop_duration_ms = 0;
+static uint32_t mqtt_tls_max_stop_duration_ms = 0;
+static uint32_t mqtt_slow_connect_count = 0;
+static uint32_t mqtt_over_5s_connect_count = 0;
+static bool     cloud_mqtt_attempt_in_progress = false;
+static uint32_t cloud_mqtt_stage_not_before_ms = 0;
+static uint32_t mqtt_tls_preconnect_attempt_count = 0;
+static uint32_t mqtt_tls_preconnect_success_count = 0;
+static uint32_t mqtt_tls_preconnect_fail_count = 0;
+static uint32_t mqtt_tls_preconnect_last_duration_ms = 0;
+static uint32_t mqtt_tls_preconnect_max_duration_ms = 0;
+static uint32_t mqtt_tls_preconnect_heap_before = 0;
+static uint32_t mqtt_tls_preconnect_heap_after = 0;
+static uint32_t mqtt_tls_preconnect_block_before = 0;
+static uint32_t mqtt_tls_preconnect_block_after = 0;
+static uint32_t mqtt_tls_preconnect_slow_count = 0;
+static uint32_t mqtt_tls_preconnect_over4s_count = 0;
+static uint32_t cloud_dns_preflight_valid_until_ms = 0;
+static IPAddress cloud_dns_preflight_ip;
+static uint32_t cloud_dns_preflight_attempt_count = 0;
+static uint32_t cloud_dns_preflight_success_count = 0;
+static uint32_t cloud_dns_preflight_fail_count = 0;
+static uint32_t cloud_dns_preflight_last_duration_ms = 0;
+static uint32_t cloud_dns_preflight_max_duration_ms = 0;
+                                                                         
+static bool     cloud_tcp_stage_ready = false;
+static uint32_t mqtt_tcp_preconnect_attempt_count = 0;
+static uint32_t mqtt_tcp_preconnect_success_count = 0;
+static uint32_t mqtt_tcp_preconnect_fail_count = 0;
+static uint32_t mqtt_tcp_preconnect_last_duration_ms = 0;
+static uint32_t mqtt_tcp_preconnect_max_duration_ms = 0;
+static uint32_t mqtt_tcp_preconnect_heap_before = 0;
+static uint32_t mqtt_tcp_preconnect_heap_after = 0;
+static uint32_t mqtt_tcp_preconnect_block_before = 0;
+static uint32_t mqtt_tcp_preconnect_block_after = 0;
+
+                                                                   
+                                                                          
+                                                             
+static void cloudTlsStopBounded(bool gracefulMqttDisconnect, const char* reason)
+{
+    if (!mqttCloudMode || !tlsClient) {
+        if (aWifiClient) aWifiClient->stop();
+        return;
+    }
+
+                                                                     
+    cloud_mqtt_attempt_in_progress = false;
+    cloud_mqtt_stage_not_before_ms = 0;
+    cloud_tcp_stage_ready = false;
+
+    const uint32_t t0 = millis();
+    mqtt_tls_stop_count++;
+
+                                                                             
+                                                                             
+                          
+    tlsClient->setTimeout(SAR_MQTT_TLS_STOP_TIMEOUT_MS);
+    mqtt_tls_timeout_reapply_count++;
+                                                                            
+                                                                              
+                                                                              
+    if (gracefulMqttDisconnect && mqttClient && mqttClient->state() == MQTT_CONNECTED) {
+        mqttClient->disconnect();
+    }
+
+                                                                              
+                                                                             
+                                                                      
+    tlsClient->setTimeout(SAR_MQTT_TLS_STOP_TIMEOUT_MS);
+    mqtt_tls_timeout_reapply_count++;
+    (void)tlsClient->stop(50U);
+    tlsClient->setTimeout(SAR_MQTT_TLS_CONNECT_TIMEOUT_MS);
+    mqtt_tls_timeout_reapply_count++;
+
+    const uint32_t dt = (uint32_t)(millis() - t0);
+    mqtt_tls_last_stop_duration_ms = dt;
+    if (dt > mqtt_tls_max_stop_duration_ms) mqtt_tls_max_stop_duration_ms = dt;
+
+    if (reason && dt > 500UL) {
+        Serial.printf_P(PSTR("[TLS] bounded stop reason=%s took=%lu ms\n"),
+                        reason, (unsigned long)dt);
+    }
+}
+
+static void cloudMqttConnectFailure(const char* stage)
+{
+    g_mqtt_last_connect_ok = false;
+    mqtt_connect_fail_count++;
+    if (mqtt_fail_streak < 250) mqtt_fail_streak++;
+    cloud_mqtt_attempt_in_progress = false;
+
+                                                                             
+                                                 
+    cloudTlsStopBounded(false, stage ? stage : "cloud-connect-failed");
+
+    uint32_t backoffMs = 120000UL;
+    if (mqtt_fail_streak <= 1) backoffMs = 15000UL;
+    else if (mqtt_fail_streak == 2) backoffMs = 30000UL;
+    else if (mqtt_fail_streak == 3) backoffMs = 60000UL;
+    cloud_next_mqtt_try_ms = millis() + backoffMs;
+
+    Serial.printf_P(PSTR("[TLS] %s failure streak=%u -> retry in %lu ms\n"),
+                    stage ? stage : "connect",
+                    (unsigned)mqtt_fail_streak, (unsigned long)backoffMs);
+}
 #endif
 
 
 static inline bool cloudBootstrapActive()
 {
-  
-  
-  
+                                                           
+                                                                             
+                                                                                               
   if (cloud_pair_bootstrap_until_ms == 0) return false;
 
   const bool active = ((int32_t)(cloud_pair_bootstrap_until_ms - millis()) > 0);
@@ -1348,32 +1686,38 @@ static inline bool cloudBootstrapActive()
 }
 
 
+                                                   
 static uint32_t addJitter(uint32_t baseMs) {
-  
+                
   int32_t j = (int32_t)(baseMs / 10);
   int32_t r = (int32_t)random(-j, j + 1);
   int32_t out = (int32_t)baseMs + r;
-  if (out < 1000) out = 1000; 
+  if (out < 1000) out = 1000;                
   return (uint32_t)out;
 }
 
-
+                                                    
 static uint32_t presence_last_use_ms = 0;
 static uint32_t presence_conn_open_ms = 0;
 
+                                                                                       
+static const uint32_t PRESENCE_CONN_MAX_AGE_MS  = 120000UL;              
 
-static const uint32_t PRESENCE_CONN_MAX_AGE_MS  = 120000UL;  
+                                                                           
+static const uint32_t PRESENCE_CONN_IDLE_CLOSE_MS = 30000UL;               
 
 
-static const uint32_t PRESENCE_CONN_IDLE_CLOSE_MS = 30000UL; 
-
-
+                                                                      
 static bool presence_polling_paused = false;
 
-
+                                                                 
 static uint32_t sar_cloud_next_telemetry_ms = 0;
 
 
+                                                                                
+                                      
+                                                                                    
+                                                                                
 static uint32_t bwc_diag_last_loop_ms = 0;
 static uint32_t bwc_diag_last_gap_ms = 0;
 static uint32_t bwc_diag_max_gap_ms = 0;
@@ -1403,7 +1747,28 @@ static inline void serviceBwcLoopDiag()
     bwc_diag_last_loop_ms = now;
 }
 
+                                                                               
+                                                                             
+                                                                               
+extern "C" void sar_bearssl_service_hook(void)
+{
+#if defined(ESP8266)
+    if (!sar_cloud_tls_handshake_in_progress || !bwc) return;
+    const uint32_t now = millis();
+    if (sar_tls_pump_service_last_ms != 0) {
+        const uint32_t gap = (uint32_t)(now - sar_tls_pump_service_last_ms);
+        if (gap < 25UL) return;
+        if (gap > sar_tls_pump_service_max_gap_ms) sar_tls_pump_service_max_gap_ms = gap;
+    }
+    sar_tls_pump_service_last_ms = now;
+    bwc->loop();
+    serviceBwcLoopDiag();
+    sar_tls_pump_service_count++;
+#endif
+}
 
+                                                                                  
+                                                                                  
 void pause_cloud_tasks_only(bool action)
 {
     if(action)
@@ -1417,7 +1782,7 @@ void pause_cloud_tasks_only(bool action)
     {
         periodicTimer.attach(periodicTimerInterval, []{ periodicTimerFlag = true; });
         startComplete_ticker.attach(60, []{ if(useMqtt) enableMqtt = true; startComplete_ticker.detach(); });
-        updateWSTimer.attach(2.0, []{ sendWSFlag = true; });
+        if (SAR_LOCAL_WEBSOCKET_ENABLED) updateWSTimer.attach(2.0, []{ sendWSFlag = true; });
     }
 }
 
@@ -1425,12 +1790,12 @@ static inline bool isPaired()
 {
     String code = mqttPairingCode;
     code.trim();
-    return code.length() >= 4; 
+    return code.length() >= 4;                                          
 }
 
 static inline bool cloudPollingEnabled()
 {
-    
+                                                                                        
     return mqttCloudMode && useMqtt && (WiFi.status() == WL_CONNECTED);
 }
 
@@ -1455,9 +1820,9 @@ static inline bool presenceMqttShouldRunNow(uint32_t now)
     const bool presenceFresh = presenceFreshForMqtt(now);
     const bool costGuardBlocking = presence_cost_guard_active && (presenceCostGuardRemainingMs(now) > 0);
 
-    
-    
-    
+                                                                     
+                                                                      
+                                                       
     const bool mqttEnabledForMode = mqttCloudMode ? useMqtt : (useMqtt && enableMqtt);
 
     return mqttEnabledForMode && !costGuardBlocking && ((presenceFresh && presence_allowed) || bootstrapActive);
@@ -1478,6 +1843,11 @@ static inline uint32_t presenceCostGuardRemainingMs(uint32_t now)
 }
 
 
+
+
+
+                                                         
+                                                                                              
 static bool cloudPresenceFetch(bool &outAllowed)
 {
 #if !defined(ESP8266)
@@ -1536,12 +1906,12 @@ static bool cloudPresenceFetch(bool &outAllowed)
                       WiFi.RSSI());
     }
 
-    
-    
-    
-    
-    
-    
+                                           
+                                                                                
+                                                                         
+                                                                       
+                                                                        
+                                                                             
     struct _PresenceHardFreezeGuard {
       _PresenceHardFreezeGuard() {
         if (bwc) bwc->beginCloudPollingGuard(20000UL);
@@ -1554,9 +1924,9 @@ static bool cloudPresenceFetch(bool &outAllowed)
     } _presenceHardFreezeGuard;
 
     auto pumpBackground = [&]() {
-      
-      
-      
+                                                                          
+                                                                      
+                                                                          
       delay(0);
       yield();
     };
@@ -1586,7 +1956,7 @@ static bool cloudPresenceFetch(bool &outAllowed)
       return false;
     };
 
-    
+                                                                          
     uint32_t fetchGateFreeHeap = ESP.getFreeHeap();
     uint32_t fetchGateMaxBlock = ESP.getMaxFreeBlockSize();
     if (fetchGateFreeHeap < PRESENCE_HEAP_SKIP_FREE_MS || fetchGateMaxBlock < presence_heap_skip_block_min_current) {
@@ -1647,7 +2017,7 @@ static bool cloudPresenceFetch(bool &outAllowed)
       return false;
     }
 
-    
+                                                
     if (presenceClient.connected()) {
       presenceClient.stop();
       yield();
@@ -1698,7 +2068,7 @@ static bool cloudPresenceFetch(bool &outAllowed)
         appendPresenceDiag(F("fallback ip connect ok"), true);
       } else {
         logTlsError("PRESENCE TLS connect FAIL(ip):");
-        
+                                                                           
         if (preferIpMode) {
           presence_ip_preferred_until_ms = 0;
           appendPresenceDiag(F("sticky ip mode cleared after ip connect fail"), true);
@@ -1734,7 +2104,7 @@ static bool cloudPresenceFetch(bool &outAllowed)
                        F(" heapMin=") + String(presence_last_heap_min) +
                        F(" blockMin=") + String(presence_last_block_min));
 
-    
+                                  
     presenceSetStage("http_send", true);
     uint32_t t_http_start = millis();
     uint32_t t_http_send_start = t_http_start;
@@ -1748,7 +2118,7 @@ static bool cloudPresenceFetch(bool &outAllowed)
     presenceClient.flush();
     presence_last_http_send_ms = millis() - t_http_send_start;
 
-    
+                                        
     presenceSetStage("wait_byte", true);
     uint32_t t_wait = millis();
     while (presenceClient.connected() && !presenceClient.available() &&
@@ -1895,7 +2265,7 @@ body_done:
 
     presence_last_body_byte = firstNonWs;
     outAllowed = (firstNonWs == '1');
-    
+                                                                                                              
     presence_last_ok_ms = millis();
     presence_last_allowed_value = outAllowed;
     presence_last_dns_ok = true;
@@ -1916,7 +2286,7 @@ body_done:
                        F(" heapEnd=") + String(presence_last_heap_end) +
                        F(" blockEnd=") + String(presence_last_block_end), true);
 
-    
+                                                                 
     presenceClient.stop();
     presence_conn_open_ms = 0;
     presence_last_use_ms  = 0;
@@ -1926,6 +2296,7 @@ body_done:
 }
 
 
+                                                       
 static void dbgCloudState(const char* tag)
 {
 #if defined(ESP8266)
@@ -1950,16 +2321,20 @@ static void dbgCloudState(const char* tag)
 }
 
 
+
 static void resetCloudPresenceTransport(const char* reason)
 {
 #if defined(ESP8266)
     if (mqttClient && mqttClient->connected()) {
         publishStatusRetained("Asleep");
-        mqttClient->disconnect();
     }
-    if (aWifiClient) aWifiClient->stop();
+    if (mqttCloudMode) cloudTlsStopBounded(true, "presence-transport-reset");
+    else {
+        if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+        if (aWifiClient) aWifiClient->stop();
+    }
     presenceClient.stop();
-    
+                                                      
     presenceTlsReady = false;
     presenceMflnProbed = false;
     presenceMflnOk = false;
@@ -1986,8 +2361,8 @@ static void updatePresenceGate()
 
   if (!cloudPollingEnabled())
   {
-    
-    
+                                                                                                    
+                                                                                                  
     presence_allowed = false;
     presence_active_until_ms = 0;
     presence_grace_until_ms  = 0;
@@ -2000,16 +2375,16 @@ static void updatePresenceGate()
     return;
   }
 
-  
+                         
   if (presence_next_poll_ms != 0 && (int32_t)(now - presence_next_poll_ms) < 0) {
     return;
   }
 
 #if defined(ESP8266)
-  
-  
-  
-  
+                                                                  
+                                                               
+                                                                              
+                                                                                  
   uint32_t gateFreeHeap = ESP.getFreeHeap();
   uint32_t gateMaxBlock = ESP.getMaxFreeBlockSize();
   bool gateFreeLow = (gateFreeHeap < PRESENCE_HEAP_SKIP_FREE_MS);
@@ -2019,9 +2394,9 @@ static void updatePresenceGate()
     presence_last_skip_heap_free = gateFreeHeap;
     presence_last_skip_heap_block = gateMaxBlock;
 
-    
-    
-    
+                                                                                   
+                                                                                  
+                                                                        
     if (!gateFreeLow &&
         gateMaxBlock >= PRESENCE_HEAP_SKIP_BLOCK_FLOOR_MS &&
         gateMaxBlock + 300UL >= presence_heap_skip_block_min_current) {
@@ -2033,9 +2408,9 @@ static void updatePresenceGate()
       presence_adaptive_near_skip_count = 0;
     }
 
-    
-    
-    
+                                                                                  
+                                                               
+                                                           
     if (!gateFreeLow && gateBlockLow &&
         presence_heap_skip_block_min_current > PRESENCE_HEAP_SKIP_BLOCK_FLOOR_MS) {
       uint32_t ageSinceOk = (presence_last_ok_ms != 0) ? (uint32_t)(now - presence_last_ok_ms) : now;
@@ -2048,8 +2423,8 @@ static void updatePresenceGate()
                        F(" mb=") + presence_last_skip_heap_block +
                        F(" blockMin=") + presence_heap_skip_block_min_current, true);
 
-    
-    
+                                                                        
+                                                                                                  
     presence_next_poll_ms = now + addJitter(45000UL);
     return;
   }
@@ -2062,9 +2437,9 @@ static void updatePresenceGate()
   bool ok = cloudPresenceFetch(allowed);
 
 #if defined(ESP8266)
-  
-  
-  
+                                                                            
+                                                                              
+                                                      
   if (ok) {
     if (presence_adaptive_last_start_heap >= PRESENCE_HEAP_SKIP_FREE_MS &&
         presence_adaptive_last_start_block >= PRESENCE_HEAP_SKIP_BLOCK_FLOOR_MS &&
@@ -2100,11 +2475,12 @@ static void updatePresenceGate()
     presence_allowed = allowed;
     presence_last_allowed_value = allowed;
 
-    
+                                                         
     if (allowed) {
       presence_active_until_ms = now + PRESENCE_ACTIVE_WINDOW_MS;
       presence_grace_until_ms  = now + PRESENCE_GRACE_MS;
       presence_next_poll_ms = now + addJitter(PRESENCE_POLL_ONLINE_MS);
+
 
 
     } else {
@@ -2115,8 +2491,8 @@ static void updatePresenceGate()
     return;
   }
 
-  
-  
+                                                          
+                                                             
   if (++presence_stall_count >= 3) {
     resetCloudPresenceTransport("3 consecutive fetch failures");
     presence_stall_count = 0;
@@ -2126,6 +2502,7 @@ static void updatePresenceGate()
   }
 
 }
+
 
 
 #if defined(ESP8266)
@@ -2155,8 +2532,8 @@ static String lastPairHash;
 
 static void sarPrepareFreshV2PairingAfterMigration()
 {
-    
-    
+                                                                              
+                                                                                    
     mqttPairingSentHash = "";
     lastPairHash = "";
     saveMqtt();
@@ -2182,17 +2559,17 @@ static void publishPairingHash()
 #endif
 
     
-    
-    
+                                                                                                   
+                                                                                                         
     if (hash.length() == 0) return;
 
-    
+                                                  
     if (hash == mqttPairingSentHash) {
-        lastPairHash = hash; 
+        lastPairHash = hash;                      
         return;
     }
 
-    
+                                                           
     if (hash == lastPairHash) return;
 
     String topic = String(mqttBaseTopic) + "/pairing/hash";
@@ -2203,7 +2580,7 @@ static void publishPairingHash()
         return;
     }
 
-    
+                                          
     lastPairHash = hash;
     mqttPairingSentHash = hash;
     saveMqtt();
@@ -2217,11 +2594,11 @@ static void publishStatusRetained(const char* status)
 
     mqttClient->publish((String(mqttBaseTopic) + F("/Status")).c_str(), status, true);
 
-    
+                                                                               
     uint32_t t0 = millis();
     while ((uint32_t)(millis() - t0) < 150) {
         if (mqttClient) mqttClient->loop();
-        delay(0);  
+        delay(0);                      
     }
 }
 
@@ -2231,16 +2608,16 @@ static void hardResetMqttStack(const char* reason)
 {
     Serial.printf_P(PSTR("MQTT HARD RESET: %s\n"), reason ? reason : "(no reason)");
 
-    
+                                                                
 
-    
-    if (mqttClient) {
-        if (mqttClient->connected()) mqttClient->disconnect();
+                                                                            
+    if (mqttCloudMode) {
+        cloudTlsStopBounded(true, "mqtt-hard-reset");
+    } else {
+        if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+        if (aWifiClient) aWifiClient->stop();
     }
-    if (tlsClient) {
-        tlsClient->stop();
-    }
-    
+                                                 
     tlsClient   = &tlsClientStatic;
     tlsCa       = &tlsCaStatic;
     aWifiClient = tlsClient;
@@ -2248,14 +2625,16 @@ static void hardResetMqttStack(const char* reason)
     mqttClient->setClient(*aWifiClient);
 
 
-    
+                                                         
     presenceClient.stop();
 
-    
-    startMqtt();
+                                                                              
+                                                                                 
+                                                                          
+    if (mqttClient) mqttClient->setClient(*aWifiClient);
 
-    
-    cloud_next_mqtt_try_ms = 0;
+                                               
+    cloud_next_mqtt_try_ms = millis() + 5000UL;
     mqtt_fail_streak = 0;
     mqtt_stack_reset_ms = millis();
 }
@@ -2275,9 +2654,9 @@ static void cloudMqttSupervisorTick()
 
     const uint32_t now = millis();
 
-    
+                                                                      
     if (!mqttClient) {
-        
+                            
         if ((int32_t)(now - mqtt_stack_reset_ms) > 30000) {
             hardResetMqttStack("mqttClient==nullptr");
         }
@@ -2290,11 +2669,11 @@ static void cloudMqttSupervisorTick()
         return;
     }
 
-    
+                                                                                             
     const bool tooLongOffline = (mqtt_last_connected_ms != 0) && ((uint32_t)(now - mqtt_last_connected_ms) > 10UL*60UL*1000UL);
-    const bool manyFails      = (mqtt_fail_streak >= 12); 
+    const bool manyFails      = (mqtt_fail_streak >= 12);                                               
 
-    
+                             
     if ((tooLongOffline || manyFails) && ((uint32_t)(now - mqtt_stack_reset_ms) > 120000UL)) {
         hardResetMqttStack(tooLongOffline ? "offline>10min" : "many connect fails");
     }
@@ -2312,17 +2691,20 @@ static void cloudV2MqttTick(bool newData)
         mqtt_loop_drop_count++;
         mqtt_last_loop_drop_ms = millis();
         mqtt_last_loop_drop_state = mqttClient->state();
+
+                                                                           
+                                                                           
+                                                                        
+        cloudTlsStopBounded(false, "mqtt-loop-drop");
+        cloud_next_mqtt_try_ms = millis() + 5000UL;
     }
 #else
     mqttClient->loop();
 #endif
 
     if (!enableMqtt || !cloudV2CredentialsProvisioned()) {
-        if (mqttClient->connected()) {
-            publishStatusRetained("Asleep");
-            mqttClient->disconnect();
-        }
-        if (aWifiClient) aWifiClient->stop();
+        if (mqttClient->connected()) publishStatusRetained("Asleep");
+        cloudTlsStopBounded(true, "cloud-disabled-or-unprovisioned");
         return;
     }
 
@@ -2339,8 +2721,8 @@ static void cloudV2MqttTick(bool newData)
     }
     if (!mqttClient->connected()) return;
 
-    
-    
+                                                                        
+                                                                             
     cloudV2ResponseTick();
 
     uint32_t nowMs = millis();
@@ -2364,10 +2746,13 @@ static void cloudV2MqttTick(bool newData)
 }
 
 
+                
 char *stack_start;
 uint32_t heap_water_mark;
 
-
+                                                                   
+                                                            
+                                                                
 static OneWire oneWireStatic(231);
 static DallasTemperature tempSensorsStatic(&oneWireStatic);
 OneWire *oneWire = &oneWireStatic;
@@ -2379,6 +2764,10 @@ void cb_gotIP(const WiFiEventStationModeGotIP& event)
 #if defined(ESP8266)
     wifi_got_ip_count++;
     wifi_last_got_ip_ms = millis();
+    cloud_dns_preflight_valid_until_ms = 0;
+    tls_admission_blocked_since_ms = 0;
+    got_ip_heap_before = ESP.getFreeHeap();
+    got_ip_block_before = ESP.getMaxFreeBlockSize();
 #endif
     Serial.print("got IP: ");
     Serial.println(WiFi.localIP());
@@ -2388,20 +2777,19 @@ void cb_gotIP(const WiFiEventStationModeGotIP& event)
                     WiFi.dnsIP(1).toString().c_str(),
                     WiFi.RSSI());
 
-    
-    
-    
+                                                                       
+                                                                              
     if (mqttCloudMode) {
-        cloud_next_mqtt_try_ms = 0;
+                                                             
+        cloud_next_mqtt_try_ms = millis() + 5000UL;
         mqtt_telemetry_enabled = false;
         mqtt_next_telemetry_ms = 0;
         sar_cloud_next_telemetry_ms = 0;
 #if defined(ESP8266)
-        if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
-        if (aWifiClient) aWifiClient->stop();
+        cloudTlsStopBounded(true, "wifi-got-ip");
 #endif
         if (SAR_CLOUD_V2_ALWAYS_ON) {
-            Serial.println(F("[WiFi] Cloud V2 MQTT re-armed after IP recovery"));
+            Serial.println(F("[WiFi] Cloud V2 MQTT re-armed after 5s IP settling"));
         } else {
             presence_allowed = false;
             presence_next_poll_ms = 0;
@@ -2413,14 +2801,28 @@ void cb_gotIP(const WiFiEventStationModeGotIP& event)
             presenceClient.stop();
 #endif
         }
+    } else {
+                                                                                
+                                                                                
+        custom_mqtt_kick = (enableMqtt || useMqtt);
+        custom_mqtt_kick_at_ms = millis();
     }
-
 
     startNTP();
     startOTA();
-    startHttpServer();
-    startWebSocket();
-    startMqtt();
+    startHttpServer();                                             
+                                                                                                  
+    if (SAR_LOCAL_WEBSOCKET_ENABLED) startWebSocket();
+
+#if defined(ESP8266)
+    got_ip_heap_after = ESP.getFreeHeap();
+    got_ip_block_after = ESP.getMaxFreeBlockSize();
+    got_ip_heap_delta = (int32_t)got_ip_heap_after - (int32_t)got_ip_heap_before;
+    got_ip_block_delta = (int32_t)got_ip_block_after - (int32_t)got_ip_block_before;
+    Serial.printf_P(PSTR("[WiFi] GotIP diag heap %u->%u (%ld), block %u->%u (%ld)\n"),
+                    got_ip_heap_before, got_ip_heap_after, (long)got_ip_heap_delta,
+                    got_ip_block_before, got_ip_block_after, (long)got_ip_block_delta);
+#endif
 }
 
 void cb_disconnected(const WiFiEventStationModeDisconnected& event)
@@ -2429,10 +2831,12 @@ void cb_disconnected(const WiFiEventStationModeDisconnected& event)
     wifi_disconnect_count++;
     wifi_last_disconnect_ms = millis();
     wifi_last_disconnect_reason = event.reason;
+    cloud_dns_preflight_valid_until_ms = 0;
+    tls_admission_blocked_since_ms = 0;
 #endif
     Serial.println(F("disconnected"));
 
-    
+                                                                        
     presence_allowed = false;
     presence_next_poll_ms = 0;
     presence_active_until_ms = 0;
@@ -2440,12 +2844,13 @@ void cb_disconnected(const WiFiEventStationModeDisconnected& event)
     cloud_next_mqtt_try_ms = 0;
 
 #if defined(ESP8266)
-    
-    if (mqttClient && mqttClient->connected()) {
-        publishStatusRetained("Asleep");
-        mqttClient->disconnect();
+                                                                         
+                                                                                
+    if (mqttCloudMode) cloudTlsStopBounded(false, "wifi-disconnected");
+    else {
+        if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+        if (aWifiClient) aWifiClient->stop();
     }
-    if (aWifiClient) aWifiClient->stop();
     presenceClient.stop();
 #endif
     resetCustomHaDiscoverySchedule();
@@ -2455,46 +2860,32 @@ void cb_disconnected(const WiFiEventStationModeDisconnected& event)
 void setup()
 {
     
-    
+                           
     char stack;
     stack_start = &stack;
 
     Serial.begin(115200);
     randomSeed(ESP.getChipId() ^ micros());
+#if defined(ESP8266)
+    generateBootId();
+#endif
     Serial.println();
     Serial.println(F("[BOOT] ResetInfo:"));
     Serial.println(ESP.getResetInfo());
-    Serial.printf_P(PSTR("[BOOT] Heap=%u maxBlock=%u frag=%u%%\n"),
-                    ESP.getFreeHeap(), ESP.getMaxFreeBlockSize(), ESP.getHeapFragmentation());
-    
-    
-    g_boot_millis = millis();
-    {
-        String tmp;
-        tmp.reserve(512);
-        tmp += F("ResetReason: ");
-        tmp += ESP.getResetReason();
-        tmp += F("\n\nResetInfo:\n");
-        tmp += ESP.getResetInfo();
-        tmp += F("\n\nLastRestartMarker:\n");
-        if (g_last_restart_marker_boot.length()) tmp += g_last_restart_marker_boot; else tmp += F("(none)");
 
-        tmp += F("\n\nBootHeap: ");
-        tmp += String(ESP.getFreeHeap());
-        tmp += F("  maxBlock: ");
-        tmp += String(ESP.getMaxFreeBlockSize());
-        tmp += F("  frag: ");
-        tmp += String(ESP.getHeapFragmentation());
-        tmp += F("%\nChipID: ");
-        tmp += String(ESP.getChipId(), HEX);
-        tmp += F("\nSDK: ");
-        tmp += ESP.getSdkVersion();
-        g_boot_diag = tmp;
-    }
+                                                                                
+                                                                          
+    g_boot_millis = millis();
+    g_boot_heap_initial = ESP.getFreeHeap();
+    g_boot_block_initial = ESP.getMaxFreeBlockSize();
+    g_boot_frag_initial = ESP.getHeapFragmentation();
+    Serial.printf_P(PSTR("[BOOT] Heap=%u maxBlock=%u frag=%u%% BOOTID=%s BUILD=%s\n"),
+                    g_boot_heap_initial, g_boot_block_initial, g_boot_frag_initial,
+                    bootIdString().c_str(), SAR_BUILD_ID);
 
 BWC_LOG_P(PSTR("\nStart\n"),0);
     BWC_LOG_P(PSTR("Millis: %d @ line: %d\n"), millis(), __LINE__);
-    
+                             
     gotIpEventHandler = WiFi.onStationModeGotIP(cb_gotIP);
     disconnectedEventHandler = WiFi.onStationModeDisconnected(cb_disconnected);
 
@@ -2511,9 +2902,43 @@ BWC_LOG_P(PSTR("\nStart\n"),0);
     loadRestartMarkerBoot();
     loadPresenceDiagBoot();
     loadPresenceCrashMarkerBoot();
+
+                                                                                  
+    {
+        String tmp;
+        tmp.reserve(896);
+        tmp += F("BUILD: ");
+        tmp += SAR_BUILD_ID;
+        tmp += F("\nBOOTID: ");
+        tmp += bootIdString();
+        tmp += F("\nResetReason: ");
+        tmp += ESP.getResetReason();
+        tmp += F("\n\nResetInfo:\n");
+        tmp += ESP.getResetInfo();
+        tmp += F("\n\nStructuredResetInfo:\n");
+#if defined(ESP8266)
+        appendStructuredResetInfo(tmp);
+#else
+        tmp += F("not available\n");
+#endif
+        tmp += F("\nLastRestartMarker:\n");
+        if (g_last_restart_marker_boot.length()) tmp += g_last_restart_marker_boot; else tmp += F("(none)");
+        tmp += F("\n\nBootHeap: ");
+        tmp += String(g_boot_heap_initial);
+        tmp += F("  maxBlock: ");
+        tmp += String(g_boot_block_initial);
+        tmp += F("  frag: ");
+        tmp += String(g_boot_frag_initial);
+        tmp += F("%\nChipID: ");
+        tmp += String(ESP.getChipId(), HEX);
+        tmp += F("\nSDK: ");
+        tmp += ESP.getSdkVersion();
+        g_boot_diag = tmp;
+    }
+
     {
         HeapSelectIram ephemeral;
-        
+                                                                     
         bwc = new BWC;
         oneWire = new OneWire(231);
         tempSensors = new DallasTemperature(oneWire);
@@ -2522,11 +2947,16 @@ BWC_LOG_P(PSTR("\nStart\n"),0);
     bwc->loop();
     serviceBwcLoopDiag();
     periodicTimer.attach(periodicTimerInterval, []{ periodicTimerFlag = true; });
-    
-    updateWSTimer.attach(2.0, []{ sendWSFlag = true; });
+                                                                              
+    if (SAR_LOCAL_WEBSOCKET_ENABLED) updateWSTimer.attach(2.0, []{ sendWSFlag = true; });
     loadWebConfig();
-    
-    
+
+                                                                             
+                                                                            
+    startMqtt();
+
+                         
+                                                                                             
 if (mqttCloudMode) {
   enableMqtt = useMqtt;
 } else {
@@ -2539,7 +2969,7 @@ if (mqttCloudMode) {
         oneWire->begin(bwc->tempSensorPin);
         tempSensors->begin();
     }
-    bwc->print("   ");  
+    bwc->print("   ");                                                   
     bwc->print(WiFi.localIP().toString());
     bwc->print("   ");
     bwc->print(FW_VERSION);
@@ -2556,29 +2986,32 @@ void loop(){
     sarHandleSerialProvisioning();
 
 
-    
-    bool newData = bwc->newData();
-    
+                                                                            
+                                                                   
+                                                                        
+                                 
     bwc->loop();
     serviceBwcLoopDiag();
+                                                                                
+    bool newData = bwc->newData();
 
-    
+                                                     
     if (WiFi.status() == WL_CONNECTED)
     {
-        
+                                      
         if (server) server->handleClient();
         sarRunPendingOnlineUpdate();
 
-        
-        
+                                                                      
+                                              
         sarCloudV2MigrationTick();
 
-        
+                                
         ArduinoOTA.handle();
 
-        
-        
-        
+                                                                       
+                                                                                            
+                                                               
         static bool presenceBootArmed = false;
         static uint32_t presenceBootArmStartMs = 0;
         if (presenceBootArmStartMs == 0) presenceBootArmStartMs = millis();
@@ -2586,35 +3019,35 @@ void loop(){
         if (mqttCloudMode && !SAR_CLOUD_V2_ALWAYS_ON && useMqtt && !presenceBootArmed) {
             if (WiFi.status() == WL_CONNECTED) {
                 presenceBootArmed = true;
-                presence_next_poll_ms = millis(); 
+                presence_next_poll_ms = millis();                 
                 if (PRESENCE_DEBUG) Serial.println(F("[CLOUD] Boot-Rearm: forcing presence poll now"));
             } else if ((uint32_t)(millis() - presenceBootArmStartMs) > 30000UL) {
-                
+                                                                                                
                 presenceBootArmed = true;
                 presence_next_poll_ms = millis();
                 if (PRESENCE_DEBUG) Serial.println(F("[CLOUD] Boot-Rearm fallback: forcing presence poll now"));
             }
         }
 
-        
+                                                                                             
         if (mqttCloudMode && !SAR_CLOUD_V2_ALWAYS_ON) {
             static uint32_t nextGateTickMs = 0;
             if ((int32_t)(millis() - nextGateTickMs) >= 0) {
-                nextGateTickMs = millis() + 2000UL; 
+                nextGateTickMs = millis() + 2000UL;      
                 updatePresenceGate();
-                
-                
+                                                                                          
+                                                                
                 const uint32_t now = millis();
                 if (cloudPollingEnabled()) {
                     if (presence_last_attempt_ms == 0) {
                         presence_last_attempt_ms = now;
                     }
                     if ((uint32_t)(now - presence_last_attempt_ms) > PRESENCE_NO_ATTEMPT_REARM_MS) {
-                        presence_next_poll_ms = now; 
+                        presence_next_poll_ms = now;                        
                         presence_force_poll_ms = now;
                     }
-                    
-                    
+                                                                                                    
+                                                                                                                 
                     if (presence_last_ok_ms != 0 && (uint32_t)(now - presence_last_ok_ms) > PRESENCE_NO_OK_STALL_MS) {
                         presence_stall_count++;
                         presence_allowed = false;
@@ -2626,7 +3059,7 @@ void loop(){
                         appendPresenceDiag(String(F("mqtt cost-guard stall disconnect ageMs=")) + String((uint32_t)(now - presence_last_ok_ms)), true);
                         cloud_next_mqtt_try_ms = now + MQTT_BACKOFF_ON_STALL_MS;
 
-                        
+                                                                                       
                         if (presence_last_stall_rearm_ms == 0 || (uint32_t)(now - presence_last_stall_rearm_ms) > 30000UL) {
                             presence_last_stall_rearm_ms = now;
 #if defined(ESP8266)
@@ -2648,7 +3081,7 @@ void loop(){
                             appendPresenceDiag(F("cloud soft rearm: presence stall watchdog"), true);
                         }
 
-                        
+                                                                                            
                         presence_next_poll_ms = now;
                         presence_force_poll_ms = now;
                         presence_last_attempt_ms = 0;
@@ -2658,15 +3091,17 @@ void loop(){
             }
         }
 
-        
+                                                                    
         delay(0);
 
 
+
+       
 if (mqttCloudMode || enableMqtt)
 {
-    
-    
-    
+                                                                 
+                                                             
+                                                                 
     if (mqttCloudMode)
     {
         if (SAR_CLOUD_V2_ALWAYS_ON) {
@@ -2692,18 +3127,19 @@ if (mqttCloudMode || enableMqtt)
             }
             presence_cost_guard_active = true;
             presence_cost_guard_until_ms = nowCloud + 30000UL;
-            if (mqttClient && mqttClient->connected())
-            {
-                publishStatusRetained("Asleep");
-                mqttClient->disconnect();
-            }
+            if (mqttClient && mqttClient->connected()) publishStatusRetained("Asleep");
+#if defined(ESP8266)
+            cloudTlsStopBounded(true, "presence-stale-guard");
+#else
+            if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
             if (aWifiClient) aWifiClient->stop();
+#endif
             cloud_next_mqtt_try_ms = nowCloud + 30000UL;
             mqttShouldRun = false;
         }
 
-        
-        
+                                                                                                 
+                                                                                                   
         if (!bootstrapActive && (!presence_allowed || !presenceFresh))
         {
             mqttShouldRun = false;
@@ -2730,16 +3166,17 @@ if (mqttCloudMode || enableMqtt)
         }
         else
         {
-            
-            if (mqttClient && mqttClient->connected())
-            {
-                publishStatusRetained("Asleep");
-                mqttClient->disconnect();
-            }
-            if (aWifiClient) aWifiClient->stop();   
+                                                                                     
+            if (mqttClient && mqttClient->connected()) publishStatusRetained("Asleep");
+#if defined(ESP8266)
+            cloudTlsStopBounded(true, "presence-gate-offline");
+#else
+            if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+            if (aWifiClient) aWifiClient->stop();
+#endif
         }
 
-        
+                                                                          
         if (mqttClient && mqttClient->connected())
         {
             uint32_t nowMs = millis();
@@ -2750,7 +3187,7 @@ if (mqttCloudMode || enableMqtt)
                 sendMQTTFlag = true;
             }
 
-            
+                                                                      
             String msg;
             msg.reserve(32);
             bwc->getButtonName(msg);
@@ -2775,26 +3212,26 @@ if (mqttCloudMode || enableMqtt)
                 mqttServiceTick();
             }
         }
-        } 
+        }                                    
     }
-    
-    
-    
+                                                                 
+                                                                  
+                                                                 
     else
     {
-        
+                                                                     
 static uint32_t custom_next_try_ms = 0;
 static uint8_t  custom_fail_streak = 0;
 
-
+                                                                           
 if (custom_mqtt_kick && (uint32_t)(millis() - custom_mqtt_kick_at_ms) > 800UL) {
     custom_mqtt_kick = false;
-    custom_next_try_ms = 0; 
+    custom_next_try_ms = 0;                    
 }
 
-
+                                                              
 if (enableMqtt && mqttClient && !mqttClient->connected()) {
-    
+                                                                              
     mqtt_telemetry_enabled = false;
     mqtt_next_telemetry_ms = 0;
     if ((int32_t)(millis() - custom_next_try_ms) >= 0) {
@@ -2804,14 +3241,14 @@ if (enableMqtt && mqttClient && !mqttClient->connected()) {
         if (!g_mqtt_last_connect_ok) {
             if (custom_fail_streak < 10) custom_fail_streak++;
 
-            
+                                                   
             uint32_t backoff = 5000UL << (custom_fail_streak < 4 ? custom_fail_streak : 4);
             if (backoff > 60000UL) backoff = 60000UL;
 
             custom_next_try_ms = millis() + backoff;
         } else {
             custom_fail_streak = 0;
-            custom_next_try_ms = millis() + 5000UL; 
+            custom_next_try_ms = millis() + 5000UL;                 
         }
     }
 }
@@ -2827,7 +3264,7 @@ if (mqttClient && mqttClient->connected())
             msg.reserve(32);
             bwc->getButtonName(msg);
 
-            
+                                                
             if (!msg.equals(prevButtonName))
             {
                 const bool retainButton = true;
@@ -2836,7 +3273,7 @@ if (mqttClient && mqttClient->connected())
                 }
             }
 
-            
+                                                                                                       
             if (!custom_ha_discovery_pending && (newData || sendMQTTFlag))
             {
                 mqttServiceTick();
@@ -2861,26 +3298,30 @@ if (mqttClient && mqttClient->connected())
     }
 #endif
 }
-
-        if (newData || sendWSFlag)
+             
+        if (SAR_LOCAL_WEBSOCKET_ENABLED && (newData || sendWSFlag))
         {
             sendWSFlag = false;
             sendWS();
         }
+        else if (!SAR_LOCAL_WEBSOCKET_ENABLED)
+        {
+            sendWSFlag = false;
+        }
     }
 
-    
+                          
     if (periodicTimerFlag)
     {
         periodicTimerFlag = false;
         if (WiFi.status() != WL_CONNECTED)
         {
             bwc->print(F("check network"));
-            
+                                                                   
         }
 if (WiFi.status() == WL_CONNECTED)
 {
-    
+                                                                         
     if (enableMqtt && !mqttCloudMode)
     {
         if (mqttClient && !mqttClient->loop())
@@ -2890,17 +3331,17 @@ if (WiFi.status() == WL_CONNECTED)
     }
 }
 
-        
+                                                                                          
         setTemperatureFromSensor();
 
-        
-        
-        
-        
-        
+                   
+                                      
+                     
+                           
             
+                           
+                                         
             
-        
     }
 
     if(checkNTP_flag)
@@ -2909,13 +3350,20 @@ if (WiFi.status() == WL_CONNECTED)
         checkNTP();
     }
 
+                                                                                  
+                                                                               
+    if (bwc && bwc->reboot_time_t == 0 && timeLooksValid())
+    {
+        checkNTP();
+    }
+
     if(CheckWiFi_flag)
     {
         CheckWiFi_flag = false;
         checkWiFi();
     }
-    
-
+                                                                            
+                                                                                               
     static uint32_t btnSeqFirstMs = 0;
     static bool btnSeqTriggered = false;
     if (bwc->getBtnSeqMatch())
@@ -2935,12 +3383,12 @@ if (WiFi.status() == WL_CONNECTED)
         btnSeqFirstMs = 0;
         btnSeqTriggered = false;
     }
-    
-    
-    
+                  
+                                   
+                                                                                 
 }
 
-
+                                          
 void write_mem_stats_to_file()
 {
     File file = LittleFS.open(F("memstats.txt"), "a");
@@ -2961,7 +3409,7 @@ void write_mem_stats_to_file()
             ESP.getMaxFreeBlockSize()
             );
     }
-    
+            
     file.printf_P(PSTR("DRam: free %d, frag %d, max block %d\n"),
         ESP.getFreeHeap(), 
         ESP.getHeapFragmentation(),
@@ -2972,12 +3420,28 @@ void write_mem_stats_to_file()
     
 
 
+                                                                                
+                
+                                                                                
+                                                                              
+                                                                                
+                                                                     
+  
+              
+                              
+                                                         
+  
+                                                                              
+                                                                              
+                                                                              
+                                                                                
+                                                                                
 static const char* SAR_UPDATE_HOST     PROGMEM = SAR_PUBLIC_UPDATE_HOST;
 static const char* SAR_UPDATE_INFO_URL PROGMEM = SAR_PUBLIC_UPDATE_INFO_URL;
 static const char* SAR_DEFAULT_FW_URL  PROGMEM = "";
 static const char* SAR_DEFAULT_FS_URL  PROGMEM = "";
 
-static uint8_t  sarOtaPending = 0; 
+static uint8_t  sarOtaPending = 0;                                          
 static bool     sarOtaRunning = false;
 static uint32_t sarOtaRequestedAt = 0;
 static String   sarOtaUrl;
@@ -2988,19 +3452,21 @@ static int      sarOtaProgress = 0;
 static uint32_t sarOtaExpectedSize = 0;
 static String   sarOtaExpectedSha256;
 
-
+                                                                               
+                                                          
 #if defined(ESP8266)
 static BearSSL::Session sarOtaTlsSession;
 #endif
 
-
-static const uint32_t SAR_OTA_RTC_MAGIC = 0x5341524FUL; 
+                                                                             
+                                                                                            
+static const uint32_t SAR_OTA_RTC_MAGIC = 0x5341524FUL;          
 static const uint32_t SAR_OTA_RTC_SLOT  = 96;
 static const char*    SAR_OTA_RESULT_FILE = "/sar_ota_result.json";
 
 struct SarOtaRtcState {
     uint32_t magic;
-    uint32_t flags;      
+    uint32_t flags;                                             
     uint32_t fwSize;
     uint32_t fsSize;
     uint32_t counter;
@@ -3091,7 +3557,7 @@ static void sarRememberOtaSuccess(uint8_t type, uint32_t size)
     st.counter++;
     sarWriteOtaRtcState(st);
 
-    
+                                                                                                 
     if (type == 1) {
         File f = LittleFS.open(SAR_OTA_RESULT_FILE, "w");
         if (f) {
@@ -3110,7 +3576,7 @@ static void sarGetPersistedOtaResult(bool& fwOk, bool& fsOk, uint32_t& fwSize, u
 {
     fwOk = false; fsOk = false; fwSize = 0; fsSize = 0;
 
-    
+                                                  
     File f = LittleFS.open(SAR_OTA_RESULT_FILE, "r");
     if (f) {
         DynamicJsonDocument doc(256);
@@ -3123,13 +3589,13 @@ static void sarGetPersistedOtaResult(bool& fwOk, bool& fsOk, uint32_t& fwSize, u
         f.close();
     }
 
-    
+                                                                                 
     SarOtaRtcState st;
     if (sarReadOtaRtcState(st)) {
         if (st.flags & 0x01) { fwOk = true; if (st.fwSize) fwSize = st.fwSize; }
         if (st.flags & 0x02) { fsOk = true; if (st.fsSize) fsSize = st.fsSize; }
 
-        
+                                                                                                  
         File wf = LittleFS.open(SAR_OTA_RESULT_FILE, "w");
         if (wf) {
             wf.print(F("{\"fwOk\":")); wf.print(fwOk ? F("true") : F("false"));
@@ -3190,8 +3656,8 @@ static String sarOtaNormalizeHash(String value)
 static bool sarOtaEnsureValidTime(uint32_t waitMs = 10000UL)
 {
     if (timeLooksValid()) return true;
-    
-    
+                                                                                  
+                                                                                 
     startNTP();
     waitForValidTime(waitMs);
     return timeLooksValid();
@@ -3200,7 +3666,7 @@ static bool sarOtaEnsureValidTime(uint32_t waitMs = 10000UL)
 static std::unique_ptr<BearSSL::WiFiClientSecure> sarMakeSecureClient(uint32_t timeoutMs, uint16_t rxSize = 4096, uint16_t txSize = 512)
 {
     std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-    
+                                                                                       
     client->setTrustAnchors(tlsCa);
     client->setSession(&sarOtaTlsSession);
     client->setTimeout(timeoutMs);
@@ -3250,7 +3716,7 @@ static bool sarOtaResolveHost(const String& host, IPAddress& out, uint8_t retrie
 static String sarOtaFriendlyHttpError(int code, const String& detail)
 {
     if (code == -4) {
-        return F("Verbindung zum Update-Server momentan nicht moeglich – bitte erneut pruefen.");
+        return F("Verbindung zum SmartAndRelax Update-Server momentan nicht moeglich – bitte erneut pruefen.");
     }
     if (code < 0) {
         return String(F("Netzwerk kurzzeitig nicht erreichbar. Details: ")) + detail;
@@ -3274,10 +3740,6 @@ static SarUpdateInfo sarFetchUpdateInfo()
     }
 
     String jsonUrl = String(FPSTR(SAR_UPDATE_INFO_URL));
-    if (jsonUrl.length() == 0) {
-        info.error = F("Update endpoint not configured");
-        return info;
-    }
     String host, path;
     if (!sarParseHttpsUrl(jsonUrl, host, path) || !host.equalsIgnoreCase(String(FPSTR(SAR_UPDATE_HOST)))) {
         info.error = F("Ungueltige Update-Server URL");
@@ -3285,7 +3747,7 @@ static SarUpdateInfo sarFetchUpdateInfo()
     }
 
     IPAddress ip;
-    sarOtaResolveHost(host, ip, 3); 
+    sarOtaResolveHost(host, ip, 3);                                                        
 
     String lastError;
     for (uint8_t attempt = 1; attempt <= 3; attempt++) {
@@ -3383,7 +3845,7 @@ static void sarSendUpdateJson(const SarUpdateInfo& info)
     out += F("\",\"firmwareSize\":"); out += info.firmwareSize;
     out += F(",\"littlefsSize\":"); out += info.littlefsSize;
     out += F(",\"integrity\":"); out += info.ok ? F("true") : F("false");
-    out += F(",\"source\":\"Update-Server\"");
+    out += F(",\"source\":\"SmartAndRelax Update-Server\"");
     out += F(",\"notes\":\""); out += sarJsonEscape(info.notes);
     bool fwOk, fsOk; uint32_t fwSize, fsSize;
     sarGetPersistedOtaResult(fwOk, fsOk, fwSize, fsSize);
@@ -3497,7 +3959,7 @@ static int sarReadHttpStatusCode(BearSSL::WiFiClientSecure& client)
 
 static bool sarParseContentRangeStart(const String& contentRange, uint32_t& startOut)
 {
-    
+                                                
     String s = contentRange;
     s.trim();
     if (!s.startsWith(F("bytes "))) return false;
@@ -3512,7 +3974,7 @@ static bool sarParseContentRangeStart(const String& contentRange, uint32_t& star
 
 static String sarSha256ToHex(const uint8_t digest[32])
 {
-    
+                                                                         
     static const char SAR_HEX_DIGITS[] = "0123456789abcdef";
     char out[65];
     for (uint8_t i = 0; i < 32; i++) {
@@ -3613,7 +4075,9 @@ static bool sarStreamHttpsUpdate(const String& url, int command, uint32_t expect
         client->setTimeout(SAR_OTA_HTTP_TIMEOUT_MS);
         client->print(F("GET ")); client->print(path); client->print(F(" HTTP/1.1\r\n"));
         client->print(F("Host: ")); client->print(host); client->print(F("\r\n"));
-        client->print(F("User-Agent: SmartAndRelax-ESP8266-OTA/4.0.0\r\n"));
+        client->print(F("User-Agent: SmartAndRelax-ESP8266-OTA/"));
+        client->print(FW_VERSION);
+        client->print(F("\r\n"));
         client->print(F("Accept: application/octet-stream\r\n"));
         client->print(F("Accept-Encoding: identity\r\n"));
         client->print(F("Cache-Control: no-cache\r\n"));
@@ -3786,7 +4250,7 @@ static bool sarStreamHttpsUpdate(const String& url, int command, uint32_t expect
 
         if (written >= expectedSize) break;
 
-        
+                                                                                      
         sarOtaLastStatus = sarOtaLastType + F(" Verbindung unterbrochen – Download wird fortgesetzt...");
         Serial.print(F("[SAR OTA] Stream interrupted, resume at byte ")); Serial.println(written);
         delay(700);
@@ -3841,13 +4305,20 @@ static void sarPrepareForOnlineUpdate()
         webSocket->disconnect();
         webSocket->close();
     }
+#if defined(ESP8266)
+    if (mqttCloudMode) cloudTlsStopBounded(true, "online-ota-prepare");
+    else {
+        if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+        if (aWifiClient) aWifiClient->stop();
+    }
+#else
     if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
     if (aWifiClient) aWifiClient->stop();
-    if (tlsClient) tlsClient->stop();
+#endif
     presenceClient.stop();
 
-    
-    
+                                                                                  
+                                                                                     
     if (server) server->close();
 
     for (uint8_t i = 0; i < 20; i++) {
@@ -3871,7 +4342,7 @@ void sarRunPendingOnlineUpdate()
     sarOtaProgress = 0;
     sarOtaLastStatus = String(sarOtaLastType) + F(" Update laeuft. Bitte nicht ausschalten...");
 
-    Serial.println(F("[SAR OTA] Online update starting (Update-Server)"));
+    Serial.println(F("[SAR OTA] Online update starting (SmartAndRelax Update-Server)"));
     Serial.print(F("[SAR OTA] Type: ")); Serial.println(sarOtaLastType);
     Serial.print(F("[SAR OTA] URL: ")); Serial.println(sarOtaUrl);
     Serial.print(F("[SAR OTA] Expected size: ")); Serial.println(sarOtaExpectedSize);
@@ -3885,62 +4356,65 @@ void sarRunPendingOnlineUpdate()
     if (ok) {
         Serial.println(F("[SAR OTA] Update OK, rebooting"));
         delay(1000);
-        ESP.restart();
+        requestRestart(job == 1 ? "OTA_SUCCESS firmware" : "OTA_SUCCESS filesystem");
     } else {
         sarOtaLastStatus = String(sarOtaLastType) + F(" Update fehlgeschlagen");
         Serial.print(F("[SAR OTA] Update failed: ")); Serial.println(sarOtaLastError);
         if (job == 2) LittleFS.begin();
-        
-        
+                                                                                       
+                                                                           
         delay(2000);
-        ESP.restart();
+        requestRestart(job == 1 ? "OTA_FAILED firmware recovery" : "OTA_FAILED filesystem recovery");
     }
 
     sarOtaRunning = false;
 }
 
 
+   
+                                                                                                 
+   
 void sendWS()
 {
     if (!webSocket || !bwc) return;
     if(webSocket->connectedClients() == 0) return;
-    
-    
-    
-    
-    
-    
+                                               
+                                                                            
+                                                                        
+                                                                         
+                                                          
+                  
     String json;
     json.reserve(384);
 
     bwc->getJSONStates(json);
     webSocket->broadcastTXT(json);
-    
+                 
     json.clear();
     bwc->getJSONTimes(json);
     webSocket->broadcastTXT(json);
-    
+                      
     json.clear();
     getOtherInfo(json);
     webSocket->broadcastTXT(json);
-    
-    
-    
-    
-    
-    
-    
+                                  
+                                     
+                                  
+                          
+                                 
+                                      
+                                        
 }
 
 void getOtherInfo(String &rtn)
 {
-    
-    StaticJsonDocument<512> doc;
-    
+                                    
+    StaticJsonDocument<640> doc;
+                                     
     doc[F("CONTENT")] = F("OTHER");
     doc[F("MQTT")] = (mqttClient ? mqttClient->state() : 999);
-    
-    
+                        
+                                                           
     doc[F("HASJETS")] = bwc->hasjets;
     doc[F("HASGOD")] = bwc->hasgod;
     doc[F("MODEL")] = bwc->getModel();
@@ -3948,33 +4422,42 @@ void getOtherInfo(String &rtn)
     doc[F("IP")] = WiFi.localIP().toString();
     doc[F("SSID")] = WiFi.SSID();
     doc[F("FW")] = FW_VERSION;
-    
-    
+    doc[F("BUILD")] = SAR_BUILD_ID;
+    doc[F("BOOTID")] = bootIdString();
+                                                                         
+                                                                          
     doc[F("REMOTE_PWR_LOCK")] = 1;
     doc[F("loopfq")] = bwc->loop_count;
     bwc->loop_count = 0;
 
-    
+                               
     if (serializeJson(doc, rtn) == 0)
     {
         rtn = F("{\"error\": \"Failed to serialize other\"}");
     }
 }
 
+/** @author 877dev */
+
+
+
+
+
+
 
 void sendMQTT()
 {
     if (!mqttClient || !mqttClient->connected()) return;
-    if (mqtt_ha_discovery_active) return;  
+    if (mqtt_ha_discovery_active) return;                                                    
 
     String json;
     json.reserve(320);
 
-    
-    
+                                                            
+                                                                  
     const bool retainTelemetry = !mqttCloudMode;
 
-    
+                                
     bwc->getJSONStates(json);
     if (mqttPublishChecked(String(mqttBaseTopic) + F("/message"), json, retainTelemetry))
     {
@@ -3986,9 +4469,9 @@ void sendMQTT()
         return;
     }
 
-    
-    
-    
+                             
+                                                                
+                                               
     if (!mqttCloudMode)
     {
         json.clear();
@@ -4004,8 +4487,8 @@ void sendMQTT()
         }
     }
 
-    
-    
+                             
+                                                            
     json.clear();
     getOtherInfo(json);
     if (mqttPublishChecked(String(mqttBaseTopic) + F("/other"), json, retainTelemetry))
@@ -4021,17 +4504,21 @@ void sendMQTT()
 
 void sendMQTTConfig()
 {
-    if (mqtt_ha_discovery_active) return;  
+    if (mqtt_ha_discovery_active) return;                                           
     String json;
     json.reserve(320);
     bwc->getJSONSettings(json);
 
-    const bool retainCfg = !mqttCloudMode; 
+    const bool retainCfg = !mqttCloudMode;                                       
 
     (void)mqttPublishChecked(String(mqttBaseTopic) + F("/get_config"), json, retainCfg);
 }
 
 
+   
+                                                                              
+                                               
+   
 void startWiFi()
 {
     BWC_LOG_P(PSTR("startWiFi() @ millis: %d\n"), millis());
@@ -4104,16 +4591,18 @@ void checkWiFi()
     {
         if (wifi_info.enableWmApFallback)
         {
-            
+                                           
             wifi_info.enableAp = false;
             wifi_info.enableStaticIp4 = false;
-            
+                                             
             startWiFiConfigPortal();
         }
     }
 }
 
-
+   
+                                         
+   
 void startWiFiConfigPortal()
 {
     Serial.println(F("WiFi > Using WiFiManager Config Portal"));
@@ -4124,10 +4613,10 @@ void startWiFiConfigPortal()
         delay(500);
     }
 
-    
-    
-    
-    
+                                                              
+                                                                                               
+                                                                                             
+                                              
     wifi_info.enableAp = true;
     wifi_info.apSsid = WiFi.SSID();
     wifi_info.apPwd = WiFi.psk();
@@ -4141,17 +4630,22 @@ void checkNTP_ISR()
 
 void checkNTP()
 {
+    if (bwc && bwc->reboot_time_t != 0) {
+        if (ntpCheck_ticker.active()) ntpCheck_ticker.detach();
+        return;
+    }
+
     time_t now = time(nullptr);
     static uint8_t ntpTryNumber = 0;
     if(now < 8 * 3600 * 2)
     {
         if (++ntpTryNumber == 10) {
-            ntpTryNumber = 0; 
+            ntpTryNumber = 0;                         
             ntpCheck_ticker.detach();
         }
         return;
     }
-    ntpCheck_ticker.detach(); 
+    ntpCheck_ticker.detach();                                 
     struct tm timeinfo;
     gmtime_r(&now, &timeinfo);
     time_t boot_timestamp = getBootTime();
@@ -4161,9 +4655,14 @@ void checkNTP()
     bwc->reboot_time_str = String(boot_time_str);
     bwc->reboot_time_t = boot_timestamp;
     bwc->saveRebootInfo();
+                                                                            
+                                                                                    
+    if (mqttCloudMode) cloud_v2_publish_config_pending = true;
 }
 
-
+   
+                 
+   
 void startNTP()
 {
     Serial.println(F("start NTP"));
@@ -4178,25 +4677,25 @@ void startOTA()
     ArduinoOTA.setPassword(OTAPassword);
 
     ArduinoOTA.onStart([]() {
-        
+                                            
         stopall();
     });
     ArduinoOTA.onEnd([]() {
-        
+                                          
     });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        
+                                                                                 
     });
     ArduinoOTA.onError([](ota_error_t error) {
-        
-        
-        
-        
-        
-        
+                                                     
+                                                                         
+                                                                                
+                                                                                    
+                                                                                    
+                                                                            
     });
     ArduinoOTA.begin();
-    
+                                        
 }
 
 void stopall()
@@ -4210,22 +4709,20 @@ void stopall()
     if (ntpCheck_ticker.active()) ntpCheck_ticker.detach();
     if (checkWifi_ticker.active()) checkWifi_ticker.detach();
 
-    
-    
-    
+                      
+                                        
+                                    
 
-    
+                       
     Serial.println(F("stopping mqtt"));
 
-    
-    if (mqttClient) {
-        if (mqttClient->connected()) mqttClient->disconnect();
-    }
-
+                                                                             
 #if defined(ESP8266)
-    aWifiClient = tlsClient; 
-    if (tlsClient) tlsClient->stop();
-    
+    if (mqttCloudMode) cloudTlsStopBounded(true, "stopall");
+    else if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+
+    aWifiClient = tlsClient;                                   
+                                                 
     tlsClient  = &tlsClientStatic;
     tlsCa      = &tlsCaStatic;
     aWifiClient = tlsClient;
@@ -4238,19 +4735,20 @@ void stopall()
 #endif
 
 
-    
-    presenceClient.stop(); 
-    
+                                             
+    presenceClient.stop();
+                                       
     presenceTlsReady = false;
 
 
-    
+
+                                                                   
     Serial.println(F("stopping server"));
-    if (server) { server->stop(); 
+    if (server) { server->stop();                         
         server = nullptr; }
 
     Serial.println(F("stopping ws"));
-    if (webSocket) { webSocket->close(); 
+    if (webSocket) { webSocket->close();                         
         webSocket = nullptr; }
 
     Serial.println(F("stopping FS"));
@@ -4261,6 +4759,7 @@ void stopall()
 }
 
 
+                                         
 void pause_all(bool action)
 {
     if(action)
@@ -4284,57 +4783,49 @@ void pause_all(bool action)
         }
         periodicTimer.attach(periodicTimerInterval, []{ periodicTimerFlag = true; });
         startComplete_ticker.attach(60, []{ if(useMqtt) enableMqtt = true; startComplete_ticker.detach(); });
-        updateWSTimer.attach(2.0, []{ sendWSFlag = true; });
-        
+        if (SAR_LOCAL_WEBSOCKET_ENABLED) updateWSTimer.attach(2.0, []{ sendWSFlag = true; });
+                                                                                                                   
     }
     bwc->pause_all(action);
 }
 
 void startWebSocket()
 {
-    HeapSelectIram ephemeral;
-    Serial.printf_P(PSTR("WS IRamheap %d\n"), ESP.getFreeHeap());
-    if(webSocket != nullptr)
-    {
-        webSocket->disconnect();
-        webSocket->close();
-        
-        webSocket = nullptr;
-    }
-    webSocket = new WebSocketsServer(81);
-    webSocket->begin();
-    webSocket->enableHeartbeat(3000, 3000, 1);
-    webSocket->onEvent(webSocketEvent);
-    
+                                                                        
+                                                                           
+                                                                             
+    return;
 }
 
-
+   
+                           
+   
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len)
 {
-    
+                                           
     switch (type)
     {
-        
+                                           
         case WStype_DISCONNECTED:
-        
+                                                                    
         break;
 
-        
+                                                       
         case WStype_CONNECTED:
         {
-            
-            
+                                                       
+                                                                                                                                  
             sendWS();
         }
         break;
 
-        
+                                       
         case WStype_TEXT:
         {
-            
-            
+                                                                                
+                                            
             StaticJsonDocument<256> doc;
-            
+                                                                                            
             if (!payload || len == 0) return;
             DeserializationError error = deserializeJson(doc, payload, len);
             if (error)
@@ -4343,7 +4834,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len)
             return;
             }
 
-            
+                                                              
             Commands command = doc[F("CMD")];
             int64_t value = doc[F("VALUE")];
             int64_t xtime = doc[F("XTIME")];
@@ -4364,7 +4855,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len)
     }
 }
 
-
+   
+                                                          
+   
 void handleDiag();
 void handleWsState();
 void handleOnlineUpdatePage();
@@ -4380,15 +4873,22 @@ void startHttpServer()
 {
     if(server != nullptr)
     {
-        server->stop();
-        server->close();
-        
-        server = nullptr;
+#if defined(ESP8266)
+        http_reuse_count++;
+#endif
+        return;
     }
 
     {
-        
+                                    
         server = new ESP8266WebServer(80);
+        if (!server) {
+            Serial.println(F("HTTP > allocation failed"));
+            return;
+        }
+#if defined(ESP8266)
+        http_init_count++;
+#endif
         server->on(F("/diag"), handleDiag);
         server->on(F("/diag/"), handleDiag);
         server->on(F("/getconfig/"), handleGetConfig);
@@ -4424,7 +4924,7 @@ void startHttpServer()
         server->on(F("/remove.html"), HTTP_POST, handleFileRemove);
         server->on(F("/remove/"), HTTP_GET, handleFileRemove);
         server->on(F("/restart/"), handleRestart);
-        server->on(F("/metrics"), handlePrometheusMetrics);  
+        server->on(F("/metrics"), handlePrometheusMetrics);                      
         server->on(F("/info/"), handleESPInfo);
         server->on(F("/sethardware/"), handleSetHardware);
         server->on(F("/gethardware/"), handleGetHardware);
@@ -4432,14 +4932,14 @@ void startHttpServer()
         server->on(F("/debug-off/"), [](){bwc->BWC_DEBUG = false; server->send(200, F("text/plain"), "ok");});
         server->on(F("/cmdq_file/"), handle_cmdq_file);
 
-        
-        
+                                                                                      
+                                       
         server->onNotFound(handleNotFound);
-        
+                                
         server->begin();
     }
     
-    
+                                                  
 }
 
 void handleGetHardware()
@@ -4448,7 +4948,7 @@ void handleGetHardware()
     File file = LittleFS.open(F("hwcfg.json"), "r");
     if (!file)
     {
-        
+                                                          
         server->send(404, F("text/plain"), F("not found"));
         return;
     }
@@ -4460,17 +4960,17 @@ void handleSetHardware()
 {
     if (!checkHttpPost(server->method())) return;
     String message = server->arg(0);
-    
+                                                              
     File file = LittleFS.open(F("hwcfg.json"), "w");
     if (!file)
     {
-        
+                                                          
         return;
     }
     file.print(message);
     file.close();
     server->send(200, F("text/plain"), "ok");
-    
+                                          
 }
 
 void preparefortest()
@@ -4491,7 +4991,7 @@ void handleInputs()
 
     bool old_pin_state[7] = {0}, new_pin_state[7] = {0};
     int counter[7] = {0};
-    unsigned long t = millis(); 
+    unsigned long t = millis();                  
 
     while(millis() < t+5000)
     {
@@ -4504,7 +5004,7 @@ void handleInputs()
         yield();
     }
 
-    
+                                   
     char s[128];
     for(int i = 0; i < 7; i++)
     {
@@ -4538,7 +5038,7 @@ void handleHWtest()
         delay(1000);
     }
 
-    
+                                          
     sprintf_P(result, PSTR("Start test. Seq begins with HIGH, then alters.\n\n"));
     server->sendContent(result);
     for(int pin = 0; pin < 3; pin++)
@@ -4568,7 +5068,7 @@ void handleHWtest()
         delay(0);
     }
 
-    
+                                   
 
     for(int pin = 0; pin < 3; pin++)
     {
@@ -4609,7 +5109,7 @@ void handleHWtest()
     server->sendContent("");
     while(true)
     {
-        
+                         
         for(int pin = 0; pin < 3; pin++)
         {
             pinMode(bwc->pins[pin+3], INPUT);
@@ -4617,7 +5117,7 @@ void handleHWtest()
             digitalWrite(bwc->pins[pin], HIGH);
         }
         delay(5000);
-        
+                        
         for(int pin = 0; pin < 3; pin++)
         {
             pinMode(bwc->pins[pin+3], INPUT);
@@ -4625,7 +5125,7 @@ void handleHWtest()
             digitalWrite(bwc->pins[pin], LOW);
         }
         delay(5000);
-        
+                         
         for(int pin = 0; pin < 3; pin++)
         {
             pinMode(bwc->pins[pin+0], INPUT);
@@ -4633,7 +5133,7 @@ void handleHWtest()
             digitalWrite(bwc->pins[pin+3], HIGH);
         }
         delay(5000);
-        
+                        
         for(int pin = 0; pin < 3; pin++)
         {
             pinMode(bwc->pins[pin+0], INPUT);
@@ -4645,9 +5145,24 @@ void handleHWtest()
     bwc->setup();
 }
 
+static inline void serviceLocalHttpBackground()
+{
+                                                                           
+                                                                         
+                                                                             
+    static uint32_t lastPumpServiceMs = 0;
+    const uint32_t now = millis();
+    if (bwc && (lastPumpServiceMs == 0 || (uint32_t)(now - lastPumpServiceMs) >= 10UL)) {
+        lastPumpServiceMs = now;
+        bwc->loop();
+        serviceBwcLoopDiag();
+    }
+    delay(0);
+}
+
 void handleNotFound()
 {
-    
+                                                                              
     if (!handleFileRead(server->uri()))
     {
         server->send(404, F("text/plain"), F("404: File Not Found"));
@@ -4665,20 +5180,26 @@ String getContentType(const String& filename)
     return F("text/plain");
 }
 
-
+   
+                                                   
+   
 bool handleFileRead(String path)
 {
-    
-    
-    
+                                                                          
+                                                                             
+                                                                               
+                                                                            
 
-    
-    if (path.endsWith("/"))
-    {
-        path += F("index.html");
+    const uint32_t entryHeap = ESP.getFreeHeap();
+    const uint32_t entryBlock = ESP.getMaxFreeBlockSize();
+    if (entryHeap < 6500UL || entryBlock < 4000UL) {
+        server->sendHeader(F("Cache-Control"), F("no-store"));
+        server->send(503, F("text/plain"), F("Web UI deferred: low heap, please retry"));
+        return true;
     }
 
-    
+    if (path.endsWith("/")) path += F("index.html");
+
     if (path.equalsIgnoreCase("/mqtt.json") ||
         path.equalsIgnoreCase("/wifi.json") ||
         path.equalsIgnoreCase(SAR_MIGRATION_STATE_PATH))
@@ -4687,67 +5208,101 @@ bool handleFileRead(String path)
         return false;
     }
 
-    String contentType = getContentType(path);   
+    String contentType = getContentType(path);
     bool isGz = false;
-    String pathWithGz = path + ".gz";
+    String pathWithGz = path + F(".gz");
 
-    if (LittleFS.exists(pathWithGz)) { isGz = true; }
-    else if (!LittleFS.exists(path)) { return false; }
-
+    if (LittleFS.exists(pathWithGz)) isGz = true;
+    else if (!LittleFS.exists(path)) return false;
     if (isGz) path = pathWithGz;
 
     File file = LittleFS.open(path, "r");
-    if (!file)
-        return false;
+    if (!file) return false;
 
+    http_file_serve_count++;
+    strncpy(http_file_last_path, path.c_str(), sizeof(http_file_last_path) - 1);
+    http_file_last_path[sizeof(http_file_last_path) - 1] = 0;
+
+    const uint32_t started = millis();
+    uint32_t lastProgress = started;
     const size_t fsize = file.size();
 
-    
-    if (isGz) {
-        server->sendHeader(F("Content-Encoding"), F("gzip"));
-    }
+    if (isGz) server->sendHeader(F("Content-Encoding"), F("gzip"));
+    server->sendHeader(F("Cache-Control"), F("no-cache"));
     server->setContentLength(fsize);
     server->send(200, contentType, "");
 
-    
     WiFiClient client = server->client();
-    static uint8_t buf[1024];
-    uint32_t lastYield = millis();
+                                                                          
+    client.setTimeout(500);
+    static uint8_t buf[384];
+    bool aborted = false;
 
     while (file.available() && client.connected())
     {
-        const size_t n = file.read(buf, sizeof(buf));
-        if (n == 0) break;
-
-        size_t written = 0;
-        while (written < n && client.connected())
-        {
-            const size_t w = client.write(buf + written, n - written);
-            if (w == 0) {
-                
-                delay(0);
-            } else {
-                written += w;
-            }
-
-            
-            if ((millis() - lastYield) > 10) {
-                lastYield = millis();
-                delay(0);
-                yield();
-            }
+        int writable = client.availableForWrite();
+        if (writable <= 0) {
+            http_file_write_stall_count++;
+            const uint32_t noProgress = (uint32_t)(millis() - lastProgress);
+            if (noProgress > http_file_max_no_progress_ms) http_file_max_no_progress_ms = noProgress;
+            if (noProgress > 5000UL) { aborted = true; break; }
+            serviceLocalHttpBackground();
+            delay(1);
+            continue;
         }
 
-        
-        delay(0);
-        yield();
+        size_t want = (size_t)writable;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        const size_t available = (size_t)file.available();
+        if (want > available) want = available;
+        if (want == 0) { serviceLocalHttpBackground(); continue; }
+
+        const size_t n = file.read(buf, want);
+        if (n == 0) { aborted = true; break; }
+
+        size_t off = 0;
+        while (off < n && client.connected())
+        {
+            int room = client.availableForWrite();
+            if (room <= 0) {
+                http_file_write_stall_count++;
+                const uint32_t noProgress = (uint32_t)(millis() - lastProgress);
+                if (noProgress > http_file_max_no_progress_ms) http_file_max_no_progress_ms = noProgress;
+                if (noProgress > 5000UL) { aborted = true; break; }
+                serviceLocalHttpBackground();
+                delay(1);
+                continue;
+            }
+
+            size_t chunk = n - off;
+            if (chunk > (size_t)room) chunk = (size_t)room;
+            const size_t w = client.write(buf + off, chunk);
+            if (w > 0) {
+                off += w;
+                lastProgress = millis();
+            } else {
+                http_file_write_stall_count++;
+            }
+            serviceLocalHttpBackground();
+        }
+        if (aborted) break;
     }
 
     file.close();
+    http_file_last_duration_ms = (uint32_t)(millis() - started);
+    if (http_file_last_duration_ms > http_file_max_duration_ms) http_file_max_duration_ms = http_file_last_duration_ms;
+
+    if (aborted) {
+        http_file_abort_count++;
+        client.stop(20);
+    }
     return true;
 }
 
 
+   
+                                 
+   
 bool checkHttpPost(HTTPMethod method)
 {
     if (method != HTTP_POST)
@@ -4758,30 +5313,132 @@ bool checkHttpPost(HTTPMethod method)
     return true;
 }
 
+   
+                           
+                                    
+   
+
+                                                                             
+                                                                             
+                                                                               
+class DiagChunkWriter
+{
+public:
+    explicit DiagChunkWriter(ESP8266WebServer* srv) : _srv(srv) { _buf.reserve(512); }
+
+    DiagChunkWriter& operator+=(const String& v) { append(v.c_str(), v.length()); return *this; }
+    DiagChunkWriter& operator+=(const char* v) { if (v) append(v, strlen(v)); return *this; }
+    DiagChunkWriter& operator+=(const __FlashStringHelper* v)
+    {
+        if (!v) return *this;
+        PGM_P ptr = reinterpret_cast<PGM_P>(v);
+        while (true) {
+            const char c = pgm_read_byte(ptr++);
+            if (!c) break;
+            appendChar(c);
+        }
+        return *this;
+    }
+
+    void flush()
+    {
+        if (!_srv || !_buf.length()) return;
+        _srv->sendContent(_buf);
+        _buf.remove(0);
+        yield();
+    }
+
+private:
+    static const size_t kFlushAt = 480;
+    ESP8266WebServer* _srv;
+    String _buf;
+
+    void appendChar(char c)
+    {
+        _buf += c;
+        if (_buf.length() >= kFlushAt) flush();
+    }
+
+    void append(const char* data, size_t len)
+    {
+        for (size_t i = 0; i < len; ++i) appendChar(data[i]);
+    }
+};
+
+static void diagAppendHtmlEscaped(DiagChunkWriter& out, const String& in)
+{
+    for (size_t i = 0; i < in.length(); ++i) {
+        switch (in[i]) {
+            case '&': out += F("&amp;");  break;
+            case '<': out += F("&lt;");   break;
+            case '>': out += F("&gt;");   break;
+            case '"': out += F("&quot;"); break;
+            default: {
+                char one[2] = { in[i], 0 };
+                out += one;
+                break;
+            }
+        }
+    }
+}
 
 void handleDiag()
 {
     if(server == nullptr) return;
 
-    String out;
-    out.reserve(3072);
+                                                                     
+    const uint32_t diagEntryHeap = ESP.getFreeHeap();
+    const uint32_t diagEntryBlock = ESP.getMaxFreeBlockSize();
+    const uint8_t diagEntryFrag = ESP.getHeapFragmentation();
+
+    if (!server->chunkedResponseModeStart(200, F("text/html; charset=utf-8"))) {
+        server->send(505, F("text/plain"), F("/diag requires HTTP/1.1"));
+        return;
+    }
+    DiagChunkWriter out(server);
 
     out += F("<html><head><meta charset='utf-8'>"
              "<meta name='viewport' content='width=device-width, initial-scale=1'>"
              "<title>ESP8266 /diag</title></head><body>"
              "<h2>ESP8266 Diagnostics</h2><pre>");
 
-    out += htmlEscape(g_boot_diag);
+    diagAppendHtmlEscaped(out, g_boot_diag);
 
     out += F("\n\n--- Live ---\nUptime(ms): ");
     out += String(millis());
     out += F("\nHeap: ");
-    out += String(ESP.getFreeHeap());
+    out += String(diagEntryHeap);
     out += F("\nmaxBlock: ");
-    out += String(ESP.getMaxFreeBlockSize());
+    out += String(diagEntryBlock);
     out += F("\nfrag: ");
-    out += String(ESP.getHeapFragmentation());
-    out += F("%\nWiFi: ");
+    out += String(diagEntryFrag);
+    out += F("%\nrestartMarkerOneShot: 1\ndiagEntryHeap: ");
+    out += String(diagEntryHeap);
+    out += F("\ndiagEntryMaxBlock: ");
+    out += String(diagEntryBlock);
+    out += F("\ndiagEntryFrag: ");
+    out += String(diagEntryFrag);
+    out += F("%\ndiagStreamingHeapNow: ");
+    out += String(ESP.getFreeHeap());
+    out += F("\ndiagStreamingMaxBlockNow: ");
+    out += String(ESP.getMaxFreeBlockSize());
+    out += F("\nheapGuardLowActive: ");
+    out += String(low_heap_since_ms != 0 ? 1 : 0);
+    out += F("\nheapGuardLowAgeMs: ");
+    out += String(low_heap_since_ms ? (uint32_t)(millis() - low_heap_since_ms) : 0UL);
+    out += F("\nheapGuardRestartsThisBoot: ");
+    out += String(heap_guard_restarts);
+    out += F("\nminHeapSeen: ");
+    out += String(min_heap_seen == 0xFFFFFFFFUL ? 0UL : min_heap_seen);
+    out += F("\nminMaxBlockSeen: ");
+    out += String(min_maxblock_seen == 0xFFFFFFFFUL ? 0UL : min_maxblock_seen);
+    out += F("\nheapGuardTlsRuntimeMode: ");
+    out += String(heap_guard_tls_runtime_mode ? 1 : 0);
+    out += F("\nheapGuardCurrentHeapLimit: ");
+    out += String(heap_guard_current_heap_limit);
+    out += F("\nheapGuardCurrentBlockLimit: ");
+    out += String(heap_guard_current_block_limit);
+    out += F("\nWiFi: ");
     out += (WiFi.status() == WL_CONNECTED) ? F("connected") : F("not connected");
     out += F("\nIP: ");
     out += WiFi.localIP().toString();
@@ -4793,6 +5450,10 @@ void handleDiag()
     out += WiFi.dnsIP(1).toString();
     out += F("\nRSSI: ");
     out += String(WiFi.RSSI());
+    out += F("\nREBOOTTIME: ");
+    out += String(bwc ? (uint32_t)bwc->reboot_time_t : 0UL);
+    out += F("\nREBOOTTIME_STR: ");
+    out += (bwc && bwc->reboot_time_str.length()) ? bwc->reboot_time_str : F("(pending NTP)");
     out += F("\nlastDnsOk: ");
     out += presence_last_dns_ok ? F("1") : F("0");
     out += F("\nlastResolvedIp: ");
@@ -4840,10 +5501,191 @@ void handleDiag()
     }
 #if defined(ESP8266)
     out += F("\n--- Cloud V2 connection diag ---");
+    out += F("\nBUILD: ");
+    out += SAR_BUILD_ID;
+    out += F("\nBOOTID: ");
+    out += bootIdString();
     out += F("\nwifiGotIpCount: ");
     out += String(wifi_got_ip_count);
     out += F("\nwifiDisconnectCount: ");
     out += String(wifi_disconnect_count);
+    out += F("\ngotIpHeapBefore: ");
+    out += String(got_ip_heap_before);
+    out += F("\ngotIpHeapAfter: ");
+    out += String(got_ip_heap_after);
+    out += F("\ngotIpHeapDelta: ");
+    out += String(got_ip_heap_delta);
+    out += F("\ngotIpBlockBefore: ");
+    out += String(got_ip_block_before);
+    out += F("\ngotIpBlockAfter: ");
+    out += String(got_ip_block_after);
+    out += F("\ngotIpBlockDelta: ");
+    out += String(got_ip_block_delta);
+    out += F("\nhttpInitCount: ");
+    out += String(http_init_count);
+    out += F("\nhttpReuseCount: ");
+    out += String(http_reuse_count);
+    out += F("\nwsInitCount: ");
+    out += String(ws_init_count);
+    out += F("\nwsReuseCount: ");
+    out += String(ws_reuse_count);
+    out += F("\nlocalWebSocketEnabled: ");
+    out += (SAR_LOCAL_WEBSOCKET_ENABLED ? F("1") : F("0"));
+    out += F("\nlocalUiTransport: HTTP_POLLING");
+    out += F("\nhttpFileServeCount: ");
+    out += String(http_file_serve_count);
+    out += F("\nhttpFileAbortCount: ");
+    out += String(http_file_abort_count);
+    out += F("\nhttpFileWriteStallCount: ");
+    out += String(http_file_write_stall_count);
+    out += F("\nhttpFileLastDurationMs: ");
+    out += String(http_file_last_duration_ms);
+    out += F("\nhttpFileMaxDurationMs: ");
+    out += String(http_file_max_duration_ms);
+    out += F("\nhttpFileMaxNoProgressMs: ");
+    out += String(http_file_max_no_progress_ms);
+    out += F("\nhttpFileLastPath: ");
+    diagAppendHtmlEscaped(out, String(http_file_last_path));
+    out += F("\nwsStateRequestCount: ");
+    out += String(wsstate_request_count);
+    out += F("\nwsStateLowHeapDeferCount: ");
+    out += String(wsstate_low_heap_defer_count);
+    out += F("\nmqttInitCount: ");
+    out += String(mqtt_init_count);
+    out += F("\nmqttReconfigureCount: ");
+    out += String(mqtt_reconfigure_count);
+    out += F("\ntlsAdmissionBlockedCount: ");
+    out += String(tls_admission_blocked_count);
+    out += F("\ntlsAdmissionLastHeap: ");
+    out += String(tls_admission_last_heap);
+    out += F("\ntlsAdmissionLastBlock: ");
+    out += String(tls_admission_last_block);
+    out += F("\ntlsAdmissionBlockedAgeMs: ");
+    out += String(tls_admission_blocked_since_ms ? (uint32_t)(millis() - tls_admission_blocked_since_ms) : 0UL);
+    out += F("\ntlsAdmissionLastBlockedAgeMs: ");
+    out += String(tls_admission_last_blocked_ms ? (uint32_t)(millis() - tls_admission_last_blocked_ms) : 0UL);
+    out += F("\ntlsAdmissionRecoveryMs: ");
+    out += String(SAR_TLS_ADMISSION_RECOVERY_MS);
+    out += F("\ntlsAdmissionRecoveryRestartsThisBoot: ");
+    out += String(tls_admission_recovery_restarts);
+    out += F("\nmqttTlsConnectTimeoutMs: ");
+    out += String(SAR_MQTT_TLS_CONNECT_TIMEOUT_MS);
+    out += F("\nbearSslTimeoutPatchActive: 1");
+    out += F("\nbearSslPumpServiceHookPatchActive: 1");
+    out += F("\ntlsPumpServiceCount: ");
+    out += String(sar_tls_pump_service_count);
+    out += F("\ntlsPumpServiceMaxGapMs: ");
+    out += String(sar_tls_pump_service_max_gap_ms);
+    out += F("\nmqttTlsRuntimeTimeoutMs: ");
+    out += String(SAR_MQTT_TLS_RUNTIME_TIMEOUT_MS);
+    out += F("\nmqttConnAckTimeoutSec: ");
+    out += String(SAR_MQTT_CONNACK_TIMEOUT_S);
+    out += F("\nmqttTlsTimeoutReapplyCount: ");
+    out += String(mqtt_tls_timeout_reapply_count);
+    out += F("\nmqttTlsStopCount: ");
+    out += String(mqtt_tls_stop_count);
+    out += F("\nmqttTlsLastStopDurationMs: ");
+    out += String(mqtt_tls_last_stop_duration_ms);
+    out += F("\nmqttTlsMaxStopDurationMs: ");
+    out += String(mqtt_tls_max_stop_duration_ms);
+    out += F("\nmqttSlowConnectCount: ");
+    out += String(mqtt_slow_connect_count);
+    out += F("\nmqttOver5sConnectCount: ");
+    out += String(mqtt_over_5s_connect_count);
+    out += F("\nmqttTlsStageGapMs: ");
+    out += String(SAR_MQTT_STAGE_GAP_MS);
+    out += F("\nmqttConnectAttemptInProgress: ");
+    out += String(cloud_mqtt_attempt_in_progress ? 1 : 0);
+    out += F("\nmqttStageNotBeforeInMs: ");
+    out += String((cloud_mqtt_stage_not_before_ms &&
+                   (int32_t)(cloud_mqtt_stage_not_before_ms - millis()) > 0)
+                      ? (uint32_t)(cloud_mqtt_stage_not_before_ms - millis()) : 0UL);
+    out += F("\ncloudDnsStageTimeoutMs: ");
+    out += String(SAR_CLOUD_DNS_STAGE_TIMEOUT_MS);
+    out += F("\ncloudDnsPreflightAttempts: ");
+    out += String(cloud_dns_preflight_attempt_count);
+    out += F("\ncloudDnsPreflightSuccesses: ");
+    out += String(cloud_dns_preflight_success_count);
+    out += F("\ncloudDnsPreflightFailures: ");
+    out += String(cloud_dns_preflight_fail_count);
+    out += F("\ncloudDnsPreflightLastDurationMs: ");
+    out += String(cloud_dns_preflight_last_duration_ms);
+    out += F("\ncloudDnsPreflightMaxDurationMs: ");
+    out += String(cloud_dns_preflight_max_duration_ms);
+    out += F("\ncloudDnsPreflightIp: ");
+    out += cloud_dns_preflight_ip.toString();
+    out += F("\ncloudDnsPreflightFreshForMs: ");
+    out += String((cloud_dns_preflight_valid_until_ms && (int32_t)(cloud_dns_preflight_valid_until_ms - millis()) > 0)
+                    ? (uint32_t)(cloud_dns_preflight_valid_until_ms - millis()) : 0UL);
+    out += F("\ncloudTcpStageTimeoutMs: ");
+    out += String(SAR_CLOUD_TCP_STAGE_TIMEOUT_MS);
+    out += F("\nmqttTcpPreconnectAttempts: ");
+    out += String(mqtt_tcp_preconnect_attempt_count);
+    out += F("\nmqttTcpPreconnectSuccesses: ");
+    out += String(mqtt_tcp_preconnect_success_count);
+    out += F("\nmqttTcpPreconnectFailures: ");
+    out += String(mqtt_tcp_preconnect_fail_count);
+    out += F("\nmqttTcpPreconnectLastDurationMs: ");
+    out += String(mqtt_tcp_preconnect_last_duration_ms);
+    out += F("\nmqttTcpPreconnectMaxDurationMs: ");
+    out += String(mqtt_tcp_preconnect_max_duration_ms);
+    out += F("\nmqttTcpPreconnectHeapBefore: ");
+    out += String(mqtt_tcp_preconnect_heap_before);
+    out += F("\nmqttTcpPreconnectHeapAfter: ");
+    out += String(mqtt_tcp_preconnect_heap_after);
+    out += F("\nmqttTcpPreconnectBlockBefore: ");
+    out += String(mqtt_tcp_preconnect_block_before);
+    out += F("\nmqttTcpPreconnectBlockAfter: ");
+    out += String(mqtt_tcp_preconnect_block_after);
+    out += F("\ncloudTcpStageReady: ");
+    out += cloud_tcp_stage_ready ? F("1") : F("0");
+    out += F("\nmqttTlsPreconnectAttempts: ");
+    out += String(mqtt_tls_preconnect_attempt_count);
+    out += F("\nmqttTlsPreconnectSuccesses: ");
+    out += String(mqtt_tls_preconnect_success_count);
+    out += F("\nmqttTlsPreconnectFailures: ");
+    out += String(mqtt_tls_preconnect_fail_count);
+    out += F("\nmqttTlsPreconnectLastDurationMs: ");
+    out += String(mqtt_tls_preconnect_last_duration_ms);
+    out += F("\nmqttTlsPreconnectMaxDurationMs: ");
+    out += String(mqtt_tls_preconnect_max_duration_ms);
+    out += F("\nmqttTlsPreconnectHeapBefore: ");
+    out += String(mqtt_tls_preconnect_heap_before);
+    out += F("\nmqttTlsPreconnectHeapAfter: ");
+    out += String(mqtt_tls_preconnect_heap_after);
+    out += F("\nmqttTlsPreconnectBlockBefore: ");
+    out += String(mqtt_tls_preconnect_block_before);
+    out += F("\nmqttTlsPreconnectBlockAfter: ");
+    out += String(mqtt_tls_preconnect_block_after);
+    out += F("\nmqttTlsPreconnectSlowCount: ");
+    out += String(mqtt_tls_preconnect_slow_count);
+    out += F("\nmqttTlsPreconnectOver4sCount: ");
+    out += String(mqtt_tls_preconnect_over4s_count);
+    out += F("\nmqttHandshakeLastDurationMs: ");
+    out += String(mqtt_last_connect_duration_ms);
+    out += F("\ntlsReclaimCount: ");
+    out += String(tls_reclaim_count);
+    out += F("\ntlsReclaimHeapBefore: ");
+    out += String(tls_reclaim_heap_before);
+    out += F("\ntlsReclaimHeapAfter: ");
+    out += String(tls_reclaim_heap_after);
+    out += F("\ntlsReclaimBlockBefore: ");
+    out += String(tls_reclaim_block_before);
+    out += F("\ntlsReclaimBlockAfter: ");
+    out += String(tls_reclaim_block_after);
+    out += F("\nmqttTlsSessionReuse: 1");
+    out += F("\ntlsTimeDeferredCount: ");
+    out += String(tls_time_deferred_count);
+    out += F("\nmqttLastConnectDurationMs: ");
+    out += String(mqtt_last_connect_duration_ms);
+    out += F("\nmqttLastConnectHeapBefore: ");
+    out += String(mqtt_last_connect_heap_before);
+    out += F("\nmqttLastConnectHeapAfter: ");
+    out += String(mqtt_last_connect_heap_after);
+    out += F("\nmqttLastConnectBlockBefore: ");
+    out += String(mqtt_last_connect_block_before);
+    out += F("\nmqttLastConnectBlockAfter: ");
+    out += String(mqtt_last_connect_block_after);
     out += F("\nwifiLastGotIpAgeMs: ");
     out += String(wifi_last_got_ip_ms ? (uint32_t)(millis() - wifi_last_got_ip_ms) : 0UL);
     out += F("\nwifiLastDisconnectAgeMs: ");
@@ -4887,7 +5729,7 @@ void handleDiag()
     out += F("\nlastBodyByte: ");
     out += String(presence_last_body_byte);
     out += F("\nlastHttpStatusLine: ");
-    out += htmlEscape(presence_last_http_status_line);
+    diagAppendHtmlEscaped(out, presence_last_http_status_line);
     out += F("\npresenceHeapSkipFreeMin: ");
     out += String(PRESENCE_HEAP_SKIP_FREE_MS);
     out += F("\npresenceHeapSkipBlockMin: ");
@@ -4923,7 +5765,7 @@ void handleDiag()
     out += F("\npresencePollSeq: ");
     out += String(presence_poll_seq);
     out += F("\npresenceLastStage: ");
-    out += htmlEscape(String(presence_last_stage));
+    diagAppendHtmlEscaped(out, String(presence_last_stage));
     out += F("\npresenceLastOutcome: ");
     out += String(presence_last_outcome);
     out += F("\npresenceLastPollDurationMs: ");
@@ -4971,7 +5813,7 @@ void handleDiag()
     out += F("\npresenceFragEnd: ");
     out += String(presence_last_frag_end);
     out += F("\n\n--- Presence crash marker from previous boot ---\n");
-    out += presence_crash_marker_boot.length() ? htmlEscape(presence_crash_marker_boot) : F("(none)");
+    if (presence_crash_marker_boot.length()) diagAppendHtmlEscaped(out, presence_crash_marker_boot); else out += F("(none)");
 
     out += F("\n\n--- Pump communication diag ---");
     out += F("\nbwcLastLoopAgeMs: ");
@@ -4998,17 +5840,26 @@ void handleDiag()
     out += String(pause_all_diag_last_duration_ms);
     out += F("\npauseAllMaxDurationMs: ");
     out += String(pause_all_diag_max_duration_ms);
-    if (bwc) {
-        bwc->getPumpDiag(out);
+                                                                               
+                                                                             
+                                                                              
+                                   
+    if (bwc && diagEntryHeap >= 6500UL && diagEntryBlock >= 3500UL) {
+        String pumpDiag;
+        pumpDiag.reserve(1024);
+        bwc->getPumpDiag(pumpDiag);
+        out += pumpDiag;
+    } else if (bwc) {
+        out += F("\npumpStateDiagDeferredLowHeap: 1");
     }
     out += F("\n\n--- Presence log (current) ---\n");
-    out += htmlEscape(presence_diag_log);
+    diagAppendHtmlEscaped(out, presence_diag_log);
     out += F("\n--- Presence log (boot/persisted) ---\n");
-    out += htmlEscape(presence_diag_boot);
+    diagAppendHtmlEscaped(out, presence_diag_boot);
 
     out += F("</pre></body></html>");
-
-    server->send(200, F("text/html; charset=utf-8"), out);
+    out.flush();
+    server->chunkedResponseFinalize();
 }
 
 
@@ -5061,7 +5912,10 @@ void handleGetConfig()
     server->send(200, F("text/plain"), json);
 }
 
-
+   
+                           
+                                    
+   
 void handleSetConfig()
 {
     if (!checkHttpPost(server->method())) return;
@@ -5077,7 +5931,10 @@ void handleSetConfig()
     send_mqtt_cfg_needed = true;
 }
 
-
+   
+                             
+                                    
+   
 void handleGetCommandQueue()
 {
     if (!checkHttpPost(server->method())) return;
@@ -5090,12 +5947,15 @@ void handleGetCommandQueue()
     server->send(200, F("application/json"), json);
 }
 
-
+   
+                            
+                             
+   
 void handleAddCommand()
 {
-    
+                                                    
 
-    
+                                    
     StaticJsonDocument<256> doc;
     String message = server->arg(0);
     DeserializationError error = deserializeJson(doc, message);
@@ -5121,12 +5981,15 @@ void handleAddCommand()
     server->send(200, F("text/plain"), F("ok"));
 }
 
-
+   
+                             
+                                                  
+   
 void handleEditCommand()
 {
     if (!checkHttpPost(server->method())) return;
 
-    
+                                    
     StaticJsonDocument<256> doc;
     String message = server->arg(0);
     DeserializationError error = deserializeJson(doc, message);
@@ -5157,12 +6020,15 @@ void handleEditCommand()
     server->send(200, F("text/plain"), "");
 }
 
-
+   
+                            
+                                                  
+   
 void handleDelCommand()
 {
     if (!checkHttpPost(server->method())) return;
 
-    
+                                    
     StaticJsonDocument<256> doc;
     String message = server->arg(0);
     DeserializationError error = deserializeJson(doc, message);
@@ -5186,7 +6052,7 @@ void handle_cmdq_file()
 {
     if (!checkHttpPost(server->method())) return;
 
-    
+                                    
     StaticJsonDocument<256> doc;
     String message = server->arg(0);
     DeserializationError error = deserializeJson(doc, message);
@@ -5216,15 +6082,15 @@ void handle_cmdq_file()
 
 void copyFile(String source, String dest)
 {
-    char ibuffer[64];  
+    char ibuffer[64];                    
     
-    File f_source = LittleFS.open(source, "r");    
+    File f_source = LittleFS.open(source, "r");                              
     if (!f_source)
     {
         return;
     }
 
-    File f_dest = LittleFS.open(dest, "w");    
+    File f_dest = LittleFS.open(dest, "w");                                    
     if (!f_dest)
     {
         return;
@@ -5232,18 +6098,20 @@ void copyFile(String source, String dest)
     
     while (f_source.available() > 0)
     {
-        byte i = f_source.readBytes(ibuffer, 64); 
-        f_dest.write(ibuffer, i);               
+        byte i = f_source.readBytes(ibuffer, 64);                                                           
+        f_dest.write(ibuffer, i);                                                          
     }
     
-    f_dest.close(); 
-    f_source.close(); 
+    f_dest.close();                                    
+    f_source.close();                               
 }
 
-
+   
+                                                             
+   
 void loadWebConfig()
 {
-    
+                                     
     StaticJsonDocument<256> doc;
 
     File file = LittleFS.open(F("/webconfig.json"), "r");
@@ -5252,14 +6120,14 @@ void loadWebConfig()
         DeserializationError error = deserializeJson(doc, file);
         if (error)
         {
-        
+                                                                     
         file.close();
         return;
         }
     }
     else
     {
-        
+                                                                               
     }
 
     showSectionTemperature = (doc.containsKey(F("SST")) ? doc[F("SST")] : true);
@@ -5271,17 +6139,19 @@ void loadWebConfig()
     useControlSelector = (doc.containsKey(F("UCS")) ? doc[F("UCS")] : false);
 }
 
-
+   
+                                                           
+   
 void saveWebConfig()
 {
     File file = LittleFS.open(F("/webconfig.json"), "w");
     if (!file)
     {
-        
+                                                              
         return;
     }
 
-    
+                                    
     StaticJsonDocument<256> doc;
 
     doc[F("SST")] = showSectionTemperature;
@@ -5294,17 +6164,20 @@ void saveWebConfig()
 
     if (serializeJson(doc, file) == 0)
     {
-        
+                                                                          
     }
     file.close();
 }
 
-
+   
+                              
+                                    
+   
 void handleGetWebConfig()
 {
     if (!checkHttpPost(server->method())) return;
 
-    
+                                    
     StaticJsonDocument<256> doc;
 
     doc[F("SST")] = showSectionTemperature;
@@ -5323,18 +6196,21 @@ void handleGetWebConfig()
     server->send(200, F("application/json"), json);
 }
 
-
+   
+                              
+                                    
+   
 void handleSetWebConfig()
 {
     if (!checkHttpPost(server->method())) return;
 
-    
+                                    
     StaticJsonDocument<256> doc;
     String message = server->arg(0);
     DeserializationError error = deserializeJson(doc, message);
     if (error)
     {
-        
+                                                           
         server->send(400, F("text/plain"), F("Error deserializing message"));
         return;
     }
@@ -5352,13 +6228,15 @@ void handleSetWebConfig()
     server->send(200, F("text/plain"), "");
 }
 
-
+   
+                                                
+   
 void loadWifi()
 {
     File file = LittleFS.open(F("/wifi.json"), "r");
     if (!file)
     {
-        
+                                                                          
         return;
     }
 
@@ -5367,7 +6245,7 @@ void loadWifi()
     DeserializationError error = deserializeJson(doc, file);
     if (error)
     {
-        
+                                                                
         file.close();
         return;
     }
@@ -5388,35 +6266,37 @@ void loadWifi()
 
     return;
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+                                               
+                                               
+                                               
+                                               
+                                               
+                                               
+                                               
+                                               
+                                             
+                                             
+                                             
+                                             
+                                                     
+                                                     
+                                                     
+                                                     
+                                                         
+                                                         
+                                                         
+                                                         
 }
 
-
+   
+                                              
+   
 void saveWifi()
 {
     File file = LittleFS.open(F("/wifi.json"), "w");
     if (!file)
     {
-        
+                                                         
         return;
     }
 
@@ -5436,12 +6316,20 @@ void saveWifi()
 
     if (serializeJson(doc, file) == 0)
     {
-        
+                                                                          
     }
     file.close();
 }
 
+   
+                         
+                                    
+   
 
+
+                                                                
+                                                                                    
+                                                                             
 void handleWsState()
 {
     if (!bwc) {
@@ -5449,20 +6337,47 @@ void handleWsState()
         return;
     }
 
-    String s1; s1.reserve(512);
-    String s2; s2.reserve(384);
-    String s3; s3.reserve(256);
-
-    bwc->getJSONStates(s1);
-    bwc->getJSONTimes(s2);
-    getOtherInfo(s3);
-
-    String out;
-    out.reserve(s1.length() + s2.length() + s3.length() + 8);
-    out += '['; out += s1; out += ','; out += s2; out += ','; out += s3; out += ']';
+    wsstate_request_count++;
+    const uint32_t fh = ESP.getFreeHeap();
+    const uint32_t mb = ESP.getMaxFreeBlockSize();
+                                                                                
+                                                                            
+    if (fh < 7000UL || mb < 4500UL) {
+        wsstate_low_heap_defer_count++;
+        server->sendHeader(F("Cache-Control"), F("no-store"));
+        server->send(503, F("text/plain"), F("low heap - retry"));
+        return;
+    }
 
     server->sendHeader(F("Cache-Control"), F("no-store, no-cache, must-revalidate, max-age=0"));
-    server->send(200, F("application/json"), out);
+    if (!server->chunkedResponseModeStart(200, F("application/json"))) {
+        server->send(505, F("text/plain"), F("HTTP/1.1 required"));
+        return;
+    }
+
+    String part;
+    part.reserve(768);
+    server->sendContent("[");
+
+    bwc->getJSONStates(part);
+    server->sendContent(part);
+    part.clear();
+    serviceLocalHttpBackground();
+
+    server->sendContent(",");
+    bwc->getJSONTimes(part);
+    server->sendContent(part);
+    part.clear();
+    serviceLocalHttpBackground();
+
+    server->sendContent(",");
+    getOtherInfo(part);
+    server->sendContent(part);
+    part.clear();
+    serviceLocalHttpBackground();
+
+    server->sendContent("]");
+    server->chunkedResponseFinalize();
 }
 
 void handleGetWifi()
@@ -5495,7 +6410,10 @@ void handleGetWifi()
     server->send(200, F("application/json"), json);
 }
 
-
+   
+                         
+                                    
+   
 void handleSetWifi()
 {
     if (!checkHttpPost(server->method())) return;
@@ -5505,7 +6423,7 @@ void handleSetWifi()
     DeserializationError error = deserializeJson(doc, message);
     if (error)
     {
-        
+                                                           
         server->send(400, F("text/plain"), F("Error deserializing message"));
         return;
     }
@@ -5528,13 +6446,17 @@ void handleSetWifi()
     server->send(200, F("text/plain"), "");
 }
 
-
+  
+                           
+                                                                                  
+                                                                                          
+   
 void handleResetWifi()
 {
     if (!server) return;
 
-    
-    
+                                                         
+                                                      
     if (server->method() == HTTP_GET) {
         const String html =
             String(F("<html><head><meta charset='utf-8'>")) +
@@ -5589,11 +6511,13 @@ void resetWiFi()
     delay(1000);
     ESP_WiFiManager wm;
     wm.resetSettings();
-    
+                        
     delay(1000);
 }
 
-
+   
+                                                
+   
 void loadMqtt()
 {
     File file = LittleFS.open(F("/mqtt.json"), "r");
@@ -5608,23 +6532,23 @@ void loadMqtt()
     DeserializationError error = deserializeJson(doc, file);
     if (error)
     {
-        
+                                                                 
         file.close();
         return;
     }
 
     useMqtt = doc[F("enableMqtt")];
-    
+                                                                    
 
-    
+                                                 
     mqttCustomIpAddress[0] = doc[F("mqttIpAddress")][0];
     mqttCustomIpAddress[1] = doc[F("mqttIpAddress")][1];
     mqttCustomIpAddress[2] = doc[F("mqttIpAddress")][2];
     mqttCustomIpAddress[3] = doc[F("mqttIpAddress")][3];
     mqttCustomPort = doc[F("mqttPort")];
     mqttCustomUsername = doc[F("mqttUsername")].as<String>();
-    
-    
+                                                                                
+                                                                            
     if (doc.containsKey(F("mqttPassword"))) {
         String pw = doc[F("mqttPassword")].as<String>();
         if (pw.length() > 0) mqttCustomPassword = pw;
@@ -5636,24 +6560,29 @@ void loadMqtt()
     {
         String mode = doc[F("mqttMode")].as<String>();
         mqttCloudMode = mode.equalsIgnoreCase("cloud");
-        
-        
-        
-        
-        
-        
+                                                    
+                                                                             
+                                                                               
+                                                                            
+                                                                            
+                                                     
         if (mqttCloudMode && !SAR_CLOUD_V2_ALWAYS_ON) {
-            
+                                                                                                
             if (!enableMqtt) {
-                if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
 #if defined(ESP8266)
-                if (aWifiClient) aWifiClient->stop();
+                if (mqttCloudMode) cloudTlsStopBounded(true, "mqtt-disabled-load");
+                else {
+                    if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
+                    if (aWifiClient) aWifiClient->stop();
+                }
+#else
+                if (mqttClient && mqttClient->connected()) mqttClient->disconnect();
 #endif
                 cloud_next_mqtt_try_ms = millis() + MQTT_BACKOFF_ON_STALL_MS;
-                
+                                     
                 presence_next_poll_ms = millis() + 5000UL;
             }
-            
+                                                          
             if (enableMqtt) {
                 presence_next_poll_ms = 0;
                 cloud_next_mqtt_try_ms = 0;
@@ -5662,8 +6591,8 @@ void loadMqtt()
 
     }
 
-    
-    
+                                                           
+                                                     
     mqttIpAddress = mqttCustomIpAddress;
     mqttPort      = mqttCustomPort;
     mqttUsername  = mqttCustomUsername;
@@ -5681,14 +6610,14 @@ if (doc.containsKey(F("mqttPairingCode")))
 
     mqttPairingCode = newCode;
 
-    
+                                                                               
     if (mqttCloudMode && newCode.length() >= 4 && newCode != oldCode)
     {
-        cloud_pair_bootstrap_until_ms = millis() + 10000UL; 
+        cloud_pair_bootstrap_until_ms = millis() + 10000UL;               
         Serial.println(F("PAIRING: bootstrap MQTT enabled for 10s"));
-        cloud_next_mqtt_try_ms = 0;   
+        cloud_next_mqtt_try_ms = 0;                                        
 
-
+                                                 
 if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->connected()) {
   Serial.println(F("PAIRING: bootstrap -> mqttConnect() now"));
   mqttConnect();
@@ -5698,15 +6627,17 @@ if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->co
 }
 
 
-    
+
+
+                                                                                             
     if (doc.containsKey(F("mqttPairingSentHash"))) {
         mqttPairingSentHash = doc[F("mqttPairingSentHash")].as<String>();
         mqttPairingSentHash.trim();
-        lastPairHash = mqttPairingSentHash; 
+        lastPairHash = mqttPairingSentHash;                      
     } else {
-        
-        
-        
+                                                                    
+                                                                                           
+                                                                         
         String code = mqttPairingCode; code.trim();
         if (mqttCloudMode && code.length() >= 4) {
             String payload = getMacClean() + ":" + code;
@@ -5717,19 +6648,23 @@ if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->co
 #endif
             mqttPairingSentHash.trim();
             lastPairHash = mqttPairingSentHash;
-            saveMqtt(); 
+            saveMqtt();                          
         }
     }
 
 }
 
 
+
+   
+                                              
+   
 void saveMqtt()
 {
     File file = LittleFS.open(F("/mqtt.json"), "w");
     if (!file)
     {
-        
+                                                         
         return;
     }
 
@@ -5737,7 +6672,7 @@ void saveMqtt()
 
     doc[F("enableMqtt")] = useMqtt;
 
-    
+                                                                              
     doc[F("mqttIpAddress")][0] = mqttCustomIpAddress[0];
     doc[F("mqttIpAddress")][1] = mqttCustomIpAddress[1];
     doc[F("mqttIpAddress")][2] = mqttCustomIpAddress[2];
@@ -5754,14 +6689,18 @@ void saveMqtt()
     doc[F("mqttPairingSentHash")] = mqttPairingSentHash;
 
 
+
     if (serializeJson(doc, file) == 0)
     {
-        
+                                                                          
     }
     file.close();
 }
 
-
+   
+                         
+                                    
+   
 void handleGetMqtt()
 {
     if (!checkHttpPost(server->method())) return;
@@ -5770,9 +6709,9 @@ void handleGetMqtt()
 
     doc[F("enableMqtt")] = useMqtt;
 
-    
-    
-    
+                                                                          
+                                                                         
+                                          
     doc[F("mqttIpAddress")][0] = mqttCustomIpAddress[0];
     doc[F("mqttIpAddress")][1] = mqttCustomIpAddress[1];
     doc[F("mqttIpAddress")][2] = mqttCustomIpAddress[2];
@@ -5780,7 +6719,7 @@ void handleGetMqtt()
     doc[F("mqttPort")]      = mqttCustomPort;
     doc[F("mqttUsername")]  = mqttCustomUsername;
 
-    
+                                                                   
     doc[F("mqttPassword")]  = "<enter password>";
 
     doc[F("mqttClientId")]  = mqttCustomClientId;
@@ -5797,6 +6736,7 @@ void handleGetMqtt()
     doc[F("mqttPairingSentHash")] = mqttPairingSentHash;
 
 
+
     String json;
     if (serializeJson(doc, json) == 0)
     {
@@ -5805,7 +6745,10 @@ void handleGetMqtt()
     server->send(200, F("text/plain"), json);
 }
 
-
+   
+                         
+                                    
+   
 void handleSetMqtt()
 {
     if (!checkHttpPost(server->method())) return;
@@ -5815,14 +6758,14 @@ void handleSetMqtt()
     DeserializationError error = deserializeJson(doc, message);
     if (error)
     {
-        
+                                                           
         server->send(400, F("text/plain"), F("Error deserializing message"));
         return;
     }
 
-    
-
-
+                                                                                              
+                                            
+                                           
 useMqtt = (bool)doc[F("enableMqtt")];
 enableMqtt = useMqtt;
 
@@ -5845,11 +6788,11 @@ if (doc.containsKey(F("mqttPairingCode")))
 
     if (mqttCloudMode && newCode.length() >= 4 && newCode != oldCode)
     {
-        cloud_pair_bootstrap_until_ms = millis() + 10000UL; 
+        cloud_pair_bootstrap_until_ms = millis() + 10000UL;               
         Serial.println(F("PAIRING: bootstrap MQTT enabled for 10s"));
-        cloud_next_mqtt_try_ms = 0;   
+        cloud_next_mqtt_try_ms = 0;                                        
 
-
+                                                 
 if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->connected()) {
   Serial.println(F("PAIRING: bootstrap -> mqttConnect() now"));
   mqttConnect();
@@ -5859,8 +6802,8 @@ if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->co
 }
 
 
-    
-    
+                                                                 
+                                                                                               
     if (!mqttCloudMode)
     {
         mqttCustomIpAddress[0] = doc[F("mqttIpAddress")][0];
@@ -5869,8 +6812,8 @@ if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->co
         mqttCustomIpAddress[3] = doc[F("mqttIpAddress")][3];
         mqttCustomPort = doc[F("mqttPort")];
         mqttCustomUsername = doc[F("mqttUsername")].as<String>();
-        
-    
+                                                                                    
+                                                                            
     if (doc.containsKey(F("mqttPassword"))) {
         String pw = doc[F("mqttPassword")].as<String>();
         if (pw.length() > 0) mqttCustomPassword = pw;
@@ -5878,7 +6821,7 @@ if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->co
         mqttCustomClientId = doc[F("mqttClientId")].as<String>();
         mqttCustomBaseTopic = doc[F("mqttBaseTopic")].as<String>();
 
-        
+                                                                                   
         mqttIpAddress = mqttCustomIpAddress;
         mqttPort      = mqttCustomPort;
         mqttUsername  = mqttCustomUsername;
@@ -5887,8 +6830,9 @@ if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->co
         mqttBaseTopic = mqttCustomBaseTopic;
     }
 
-    
+                                                            
     mqttTelemetryInterval = doc[F("mqttTelemetryInterval")];
+
 
 
     server->send(200, F("text/plain"), "");
@@ -5898,15 +6842,18 @@ if (WiFi.status() == WL_CONNECTED && enableMqtt && mqttClient && !mqttClient->co
     saveMqtt();
     startMqtt();
 
-    
-    
+                                                           
+                                                                                      
     if (mqttClient && mqttClient->connected()) {
         publishPairingHash();
 }
 
 }
 
-
+   
+                     
+                                    
+   
 void handleDir()
 {
     HeapSelectIram ephemeral;
@@ -5919,14 +6866,14 @@ void handleDir()
     Dir root = LittleFS.openDir("/");
     while (root.next())
     {
-        
+                                                                            
         String rawName = root.fileName();
         if (rawName == F("sar_migration_state.json") ||
             rawName == F("/sar_migration_state.json")) {
             continue;
         }
 
-        
+                                           
         String href = root.fileName();
         if (href.endsWith(".gz")) href.remove(href.length()-3);
         mydir += F("<a href=\"/");
@@ -5946,7 +6893,10 @@ void handleDir()
     server->sendContent("");
 }
 
-
+   
+                            
+                                    
+   
 void handleFileUpload()
 {
     HTTPUpload& upload = server->upload();
@@ -5959,12 +6909,12 @@ void handleFileUpload()
             path = "/" + path;
         }
 
-        
+                                                                        
         if (!path.endsWith(".gz"))
         {
-            
+                                                                                
             String pathWithGz = path + ".gz";
-            
+                                                                  
             if (LittleFS.exists(pathWithGz))
             {
                 LittleFS.remove(pathWithGz);
@@ -5974,7 +6924,7 @@ void handleFileUpload()
         Serial.print(F("handleFileUpload Name: "));
         Serial.println(path);
 
-        
+                                                                             
         fsUploadFile = LittleFS.open(path, "w");
         path = String();
     }
@@ -5982,10 +6932,10 @@ void handleFileUpload()
     {
         if (fsUploadFile)
         {
-            
+                                                   
             fsUploadFile.write(upload.buf, upload.currentSize);
-            
-            
+                                           
+                                    
         }
     }
     else if (upload.status == UPLOAD_FILE_END)
@@ -6020,7 +6970,10 @@ void handleFileUpload()
     }
 }
 
-
+   
+                            
+                                  
+   
 void handleFileRemove()
 {
     String path;
@@ -6030,13 +6983,13 @@ void handleFileRemove()
         path = "/" + path;
     }
 
-    
-    
+                                                  
+                            
 
     if (LittleFS.exists(path) && LittleFS.remove(path))
     {
-        
-        
+                                                         
+                                
         if(server->method() == HTTP_GET)
             server->sendHeader(F("Location"), F("/dir/"));
         else
@@ -6045,25 +6998,28 @@ void handleFileRemove()
     }
     else
     {
-        
-        
+                                                       
+                                
         server->send(500, F("text/plain"), F("500: couldn't delete file"));
     }
 }
 
-
+   
+                         
+   
 void handleRestart()
 {
     if (!server) return;
 
-    
-    
+                                                                                       
+                                                      
     if (server->method() == HTTP_GET) {
         const String html =
             String(F("<html><head><meta charset='utf-8'>")) +
             F("<title>Restart</title></head><body>") +
             F("<h3>Restart device</h3>") +
             F("<form method='POST' action='/restart/'>") +
+            F("<input type='hidden' name='bootid' value='") + bootIdString() + F("'>") +
             F("<button type='submit'>Confirm restart</button>") +
             F("</form>") +
             F("<p><a href='/'>Cancel</a></p>") +
@@ -6077,7 +7033,14 @@ void handleRestart()
         return;
     }
 
-    
+                                                                               
+                                                                  
+    if (!server->hasArg("bootid") || server->arg("bootid") != bootIdString()) {
+        server->send(409, F("text/plain"), F("Restart confirmation expired. Open /restart/ again."));
+        return;
+    }
+
+                                                                                          
     server->send(200, F("text/plain"), F("Restarting..."));
     delay(200);
 
@@ -6102,9 +7065,20 @@ void updateError(int err){
     Serial.printf_P(PSTR("update fatal error code %d\n"), err);
 }
 
+/** @author 877dev */
+
+
 
 void startMqtt()
 {
+#if defined(ESP8266)
+    if (!mqtt_stack_initialized) {
+        mqtt_stack_initialized = true;
+        mqtt_init_count++;
+    } else {
+        mqtt_reconfigure_count++;
+    }
+#endif
     Serial.printf_P(PSTR("DRAM heap before MQTT: %u\n"), ESP.getFreeHeap());
     {
         HeapSelectIram e;
@@ -6112,66 +7086,90 @@ void startMqtt()
     }
 
     Serial.println(F("startmqtt"));
+#if defined(ESP8266)
+    cloud_dns_preflight_valid_until_ms = 0;
+    cloud_mqtt_stage_not_before_ms = 0;
+#endif
 
-    
+                                                                         
     loadMqtt();
 
-    
-    
-    
-    
+                                                                          
+                                                                            
+                                                                         
+                                                                           
     if (mqttCloudMode) {
         enableMqtt = useMqtt;
 
-        
-        
+                                                                           
+                                                                     
         if (SAR_CLOUD_V2_ALWAYS_ON && enableMqtt && cloudV2CredentialsProvisioned()) {
             cloud_next_mqtt_try_ms = 0;
         }
     }
 
 #if defined(ESP8266)
-    
+                        
     if (mqttCloudMode) {
-        
+                                                             
         tlsClient = &tlsClientStatic;
         tlsCa     = &tlsCaStatic;
 
         tlsClient->setTrustAnchors(tlsCa);
+                                                                                
+                                                                             
+                                                                      
+        tlsClient->setSession(&mqttTlsSessionStatic);
 
-        
+                                  
         tlsClient->setBufferSizes(512, 512);
 
-        
-        tlsClient->setTimeout(15);
+                                                                               
+                                                                             
+                                                              
+        tlsClient->setTimeout(SAR_MQTT_TLS_CONNECT_TIMEOUT_MS);
+        mqtt_tls_timeout_reapply_count++;
+                                                                           
+                                         
+        tlsClient->setSSLVersion(BR_TLS12, BR_TLS12);
 
         aWifiClient = tlsClient;
     }
-    
+                                           
     else {
         aWifiClient = &wifiClientPlainStatic;
     }
 #else
-    
+                                              
     aWifiClient = &wifiClientStatic;
 #endif
 
 mqttClient = &mqttClientStatic; mqttClient->setClient(*aWifiClient);
 
-
-    
+                                                   
+                                                                                     
+                                                                                                                
     if (!mqttClient->setBufferSize(mqttCloudMode ? 1024 : 2048)) {
         Serial.println(F("MQTT > WARNING: setBufferSize failed"));
     }
 
 
-    
+                                                                          
+                                                                                 
+                                  
+#if defined(ESP8266)
+    if (mqttCloudMode) cloudTlsStopBounded(true, "start-mqtt-reconfigure");
+    else mqttClient->disconnect();
+#else
     mqttClient->disconnect();
+#endif
 
-
+                              
 String devId = getMacClean();
 
-
+                                 
+                                   
+                                 
 if (mqttCloudMode)
 {
     mqttClientId  = devId;
@@ -6185,7 +7183,7 @@ if (mqttCloudMode)
 }
 else
 {
-    
+                                                                     
     mqttIpAddress = mqttCustomIpAddress;
     mqttPort      = mqttCustomPort;
     mqttUsername  = mqttCustomUsername;
@@ -6195,13 +7193,14 @@ else
 
     mqttClient->setServer(mqttIpAddress, mqttPort);
 
-    
+                                                                         
     if (mqttClientId.length() == 0) mqttClientId = devId;
 }
 
 
+
     mqttClient->setKeepAlive(mqttCloudMode ? 60 : 60);
-    mqttClient->setSocketTimeout(mqttCloudMode ? 15 : 10);
+    mqttClient->setSocketTimeout(mqttCloudMode ? SAR_MQTT_CONNACK_TIMEOUT_S : 10);
 #if defined(ESP8266)
     if (!mqttCloudMode) {
         wifiClientPlainStatic.setTimeout(10);
@@ -6215,18 +7214,25 @@ else
         Serial.printf_P(PSTR("IRAM heap after MQTT init: %u\n"), ESP.getFreeHeap());
     }
 
-    
-    
-    
+                                                      
+                                                                      
+                                                                               
     if (!mqttCloudMode) {
-        enableMqtt = useMqtt;                 
-        custom_mqtt_kick = enableMqtt;        
+        enableMqtt = useMqtt;                                                            
+        custom_mqtt_kick = enableMqtt;                                                   
         custom_mqtt_kick_at_ms = millis();
         resetCustomHaDiscoverySchedule();
     }
 
 }
 
+
+                                                                                
+                          
+                                                                                
+                                                                               
+                                                                               
+                                         
 
 static void cloudV2SetAck(const char* op, bool ok, const String& rid = String(), const char* detail = nullptr)
 {
@@ -6284,8 +7290,8 @@ static void cloudV2ResponseTick()
 {
     if (!mqttCloudMode || !mqttClient || !mqttClient->connected()) return;
 
-    
-    
+                                                                            
+                                                                                 
     if (cloud_v2_ack.pending) {
         (void)cloudV2PublishAck();
         return;
@@ -6311,18 +7317,21 @@ static void cloudV2ResponseTick()
         return;
     }
     if (cloud_v2_publish_queue_pending) {
-        
-        
+                                                                              
+                                                                              
         cloud_v2_publish_queue_pending = false;
         (void)cloudV2PublishQueueState();
         return;
     }
 }
 
+/** @author 877dev */
+
+
 
 void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
-    
+                                                                                 
     String message;
     message.reserve(length + 1);
     for (unsigned int i = 0; i < length; i++)
@@ -6330,12 +7339,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 
     String t = String(topic);
 
-    
-    
-    
-    
+                                                                            
+                                                                            
+                                                                          
+                                                                            
 
-    
+                                     
     if (t.equals(String(mqttBaseTopic) + F("/command")))
     {
         StaticJsonDocument<256> doc;
@@ -6367,7 +7376,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    
+                                           
     if (t.equals(String(mqttBaseTopic) + F("/command_batch")))
     {
         DynamicJsonDocument doc(1024);
@@ -6405,8 +7414,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         }
 
         if (mqttCloudMode) {
-            
-            
+                                                                             
+                                                                      
             char detail[48];
             snprintf(detail, sizeof(detail), "accepted=%u", accepted);
             cloudV2SetAck("command_batch", ok, String(), detail);
@@ -6415,30 +7424,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    
+                                        
     if (t.equals(String(mqttBaseTopic) + F("/set_config")))
     {
-        
+                                                                           
         if (bwc) {
             bwc->setJSONSettings(message);
             send_mqtt_cfg_needed = true;
         }
         if (mqttCloudMode) {
-            
-            
+                                                                               
+                                                                    
             cloudV2SetAck("set_config", bwc != nullptr, String(), bwc ? "accepted" : "service_unavailable");
             cloud_v2_publish_config_pending = true;
         }
         return;
     }
 
-    
-    
-    
-    
+                                                                            
+                                                                              
+                                                                    
+                                                                            
     if (!mqttCloudMode) return;
 
-    
+                                                               
     if (t.equals(String(mqttBaseTopic) + F("/smartschedule/set")))
     {
         StaticJsonDocument<320> doc;
@@ -6454,11 +7463,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         const bool ok = bwc && bwc->setSmartSchedule(targetTime, targetTemp, keepOn, poolCapacity);
         cloudV2SetAck("smartschedule/set", ok, rid, ok ? "accepted" : "invalid_values_or_time");
         cloud_v2_publish_smartschedule_pending = true;
-        cloud_v2_publish_config_pending = true; 
+        cloud_v2_publish_config_pending = true;                            
         return;
     }
 
-    
+                                                                  
     if (t.equals(String(mqttBaseTopic) + F("/smartschedule/update")))
     {
         StaticJsonDocument<160> doc;
@@ -6473,7 +7482,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    
+                                                                  
     if (t.equals(String(mqttBaseTopic) + F("/smartschedule/cancel")))
     {
         StaticJsonDocument<96> doc;
@@ -6483,11 +7492,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         if (bwc) bwc->cancelSmartSchedule();
         cloudV2SetAck("smartschedule/cancel", ok, rid, ok ? "accepted" : "service_unavailable");
         cloud_v2_publish_smartschedule_pending = true;
-        cloud_v2_publish_queue_pending = true; 
+        cloud_v2_publish_queue_pending = true;                                      
         return;
     }
 
-    
+                                                    
     if (t.equals(String(mqttBaseTopic) + F("/queue/get")))
     {
         StaticJsonDocument<96> doc;
@@ -6498,7 +7507,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    
+                                                    
     if (t.equals(String(mqttBaseTopic) + F("/queue/add")))
     {
         StaticJsonDocument<320> doc;
@@ -6520,7 +7529,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    
+                                                     
     if (t.equals(String(mqttBaseTopic) + F("/queue/edit")))
     {
         StaticJsonDocument<320> doc;
@@ -6543,7 +7552,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    
+                                                       
     if (t.equals(String(mqttBaseTopic) + F("/queue/delete")))
     {
         StaticJsonDocument<128> doc;
@@ -6559,7 +7568,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
-    
+                                                      
     if (t.equals(String(mqttBaseTopic) + F("/request_state")))
     {
         StaticJsonDocument<96> doc;
@@ -6567,9 +7576,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         if (message.length() > 0 && !deserializeJson(doc, message)) rid = doc[F("RID")] | "";
         cloudV2SetAck("request_state", bwc != nullptr, rid, bwc ? "accepted" : "service_unavailable");
         if (bwc) {
-            cloud_v2_publish_telemetry_pending = true;  
-            cloud_v2_publish_times_pending = true;      
-            cloud_v2_publish_config_pending = true;     
+            cloud_v2_publish_telemetry_pending = true;                      
+            cloud_v2_publish_times_pending = true;                                     
+            cloud_v2_publish_config_pending = true;                   
             cloud_v2_publish_smartschedule_pending = true;
             cloud_v2_publish_queue_pending = true;
         }
@@ -6578,6 +7587,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 }
 
 
+   
+                                                                                   
+   
 void mqttConnect()
 {
     if (!enableMqtt)
@@ -6591,48 +7603,358 @@ void mqttConnect()
     Serial.println(F("mqttconn"));
 #if defined(ESP8266)
     mqtt_last_attempt_ms = millis();
-    mqtt_connect_attempt_count++;
-#endif
-    #if defined(ESP8266)
-  
-  if (mqttCloudMode) {
+
+                                                                             
+                                                                             
+                                                                          
+    if (mqttCloudMode && cloud_mqtt_attempt_in_progress &&
+        cloud_mqtt_stage_not_before_ms != 0) {
+        const uint32_t nowStage = millis();
+        if ((int32_t)(nowStage - cloud_mqtt_stage_not_before_ms) < 0) return;
+        cloud_mqtt_stage_not_before_ms = 0;
+    }
+
+                                                                             
+                                                                          
+                                                                             
+                                                                             
+                                                                             
+    if (mqttCloudMode && !cloud_mqtt_attempt_in_progress && (!tlsClient || !tlsClient->connected())) {
+        uint32_t fh = ESP.getFreeHeap();
+        uint32_t mb = ESP.getMaxFreeBlockSize();
+
+                                                                             
+                                                                               
+                                                                              
+                                                                              
+                                                         
+        if ((fh < SAR_TLS_ADMISSION_MIN_HEAP || mb < SAR_TLS_ADMISSION_MIN_BLOCK) &&
+            mqttClient && !mqttClient->connected() && aWifiClient) {
+            tls_reclaim_heap_before = fh;
+            tls_reclaim_block_before = mb;
+            cloudTlsStopBounded(false, "tls-admission-reclaim");
+            yield();
+            delay(0);
+            fh = ESP.getFreeHeap();
+            mb = ESP.getMaxFreeBlockSize();
+            tls_reclaim_heap_after = fh;
+            tls_reclaim_block_after = mb;
+            tls_reclaim_count++;
+        }
+
+        tls_admission_last_heap = fh;
+        tls_admission_last_block = mb;
+        if (fh < SAR_TLS_ADMISSION_MIN_HEAP || mb < SAR_TLS_ADMISSION_MIN_BLOCK) {
+            const uint32_t nowAdmission = millis();
+            tls_admission_blocked_count++;
+            tls_admission_last_blocked_ms = nowAdmission;
+            if (tls_admission_blocked_since_ms == 0) tls_admission_blocked_since_ms = nowAdmission;
+            g_mqtt_last_connect_ok = false;
+
+            const uint32_t blockedAge = (uint32_t)(nowAdmission - tls_admission_blocked_since_ms);
+            if (blockedAge >= SAR_TLS_ADMISSION_RECOVERY_MS) {
+                tls_admission_recovery_restarts++;
+                String reason = String(F("TLS_ADMISSION_STUCK fh=")) + fh +
+                                F(" mb=") + mb +
+                                F(" ageMs=") + blockedAge +
+                                F(" blocks=") + tls_admission_blocked_count;
+                Serial.println(String(F("[TLS] ")) + reason + F(" -> controlled restart"));
+                cloudTlsStopBounded(false, "tls-admission-stuck");
+                requestRestart(reason.c_str());
+                return;
+            }
+
+            cloud_next_mqtt_try_ms = nowAdmission + SAR_TLS_ADMISSION_RETRY_MS;
+            Serial.printf_P(PSTR("[TLS] admission blocked heap=%u block=%u age=%lu ms -> retry %lu ms\n"),
+                            fh, mb, (unsigned long)blockedAge,
+                            (unsigned long)SAR_TLS_ADMISSION_RETRY_MS);
+            return;
+        }
+                                                                          
+        tls_admission_blocked_since_ms = 0;
+                                                                               
+                                                                                  
+        if (!timeLooksValid()) {
+            tls_time_deferred_count++;
+            g_mqtt_last_connect_ok = false;
+            cloud_next_mqtt_try_ms = millis() + 5000UL;
+            Serial.println(F("[TLS] system time not valid yet -> retry 5s"));
+            return;
+        }
+    }
+
+                                            
+                                                   
+                                                       
+                                                                        
+                                                
       
-      waitForValidTime(8000);
-      if (tlsClient) tlsClient->setX509Time(time(nullptr));
-  }
+                                                                             
+                                                                                
+    if (mqttCloudMode && tlsClient && !tlsClient->connected()) {
+        const uint32_t nowDns = millis();
+        const bool dnsFresh = cloud_dns_preflight_valid_until_ms != 0 &&
+                              (int32_t)(cloud_dns_preflight_valid_until_ms - nowDns) > 0;
+        if (!dnsFresh) {
+            if (!cloud_mqtt_attempt_in_progress) {
+                cloud_mqtt_attempt_in_progress = true;
+                mqtt_connect_attempt_count++;
+            }
+
+            IPAddress resolved;
+            cloud_dns_preflight_attempt_count++;
+            const uint32_t dnsStartedMs = millis();
+            pause_cloud_tasks_only(true);
+            yield(); delay(0);
+            const bool dnsOk = WiFi.hostByName(SAR_CLOUD_HOST, resolved, SAR_CLOUD_DNS_STAGE_TIMEOUT_MS) == 1;
+            pause_cloud_tasks_only(false);
+            yield(); delay(0);
+            cloud_dns_preflight_last_duration_ms = (uint32_t)(millis() - dnsStartedMs);
+            if (cloud_dns_preflight_last_duration_ms > cloud_dns_preflight_max_duration_ms)
+                cloud_dns_preflight_max_duration_ms = cloud_dns_preflight_last_duration_ms;
+
+            if (!dnsOk || !resolved.isSet()) {
+                cloud_dns_preflight_fail_count++;
+                cloud_dns_preflight_valid_until_ms = 0;
+                cloudMqttConnectFailure("dns-preflight");
+                Serial.println(F("end mqttcon (DNS stage failed)"));
+                return;
+            }
+
+            cloud_dns_preflight_success_count++;
+            cloud_dns_preflight_ip = resolved;
+            cloud_dns_preflight_valid_until_ms = millis() + SAR_CLOUD_DNS_CACHE_VALID_MS;
+            cloud_tcp_stage_ready = false;
+            cloud_mqtt_stage_not_before_ms = millis() + SAR_MQTT_STAGE_GAP_MS;
+            cloud_next_mqtt_try_ms = cloud_mqtt_stage_not_before_ms;
+            Serial.printf_P(PSTR("[TLS] DNS preflight OK ip=%s in %lu ms -> TCP stage next loop\n"),
+                            resolved.toString().c_str(),
+                            (unsigned long)cloud_dns_preflight_last_duration_ms);
+            return;
+        }
+
+        if (!cloud_mqtt_attempt_in_progress) {
+            cloud_mqtt_attempt_in_progress = true;
+            mqtt_connect_attempt_count++;
+        }
+
+                                                                               
+                                                                                
+                                                                                
+        if (!cloud_tcp_stage_ready) {
+            cloudTlsStopBounded(false, "tcp-preconnect-clean");
+            cloud_mqtt_attempt_in_progress = true;
+
+            mqtt_tcp_preconnect_attempt_count++;
+            mqtt_tcp_preconnect_heap_before = ESP.getFreeHeap();
+            mqtt_tcp_preconnect_block_before = ESP.getMaxFreeBlockSize();
+            const uint32_t tcpStartedMs = millis();
+
+            pause_cloud_tasks_only(true);
+            yield(); delay(0);
+            const bool tcpOk = (tlsClientStatic.connectTcpOnly(cloud_dns_preflight_ip, mqttPort,
+                                                               SAR_CLOUD_TCP_STAGE_TIMEOUT_MS) == 1);
+            pause_cloud_tasks_only(false);
+            yield(); delay(0);
+
+            mqtt_tcp_preconnect_last_duration_ms = (uint32_t)(millis() - tcpStartedMs);
+            if (mqtt_tcp_preconnect_last_duration_ms > mqtt_tcp_preconnect_max_duration_ms)
+                mqtt_tcp_preconnect_max_duration_ms = mqtt_tcp_preconnect_last_duration_ms;
+            mqtt_tcp_preconnect_heap_after = ESP.getFreeHeap();
+            mqtt_tcp_preconnect_block_after = ESP.getMaxFreeBlockSize();
+
+            if (!tcpOk || !tlsClientStatic.tcpConnectedOnly()) {
+                mqtt_tcp_preconnect_fail_count++;
+                cloudMqttConnectFailure("tcp-preconnect");
+                Serial.println(F("end mqttcon (TCP stage failed)"));
+                return;
+            }
+
+            mqtt_tcp_preconnect_success_count++;
+            cloud_tcp_stage_ready = true;
+            cloud_mqtt_attempt_in_progress = true;
+            cloud_mqtt_stage_not_before_ms = millis() + SAR_MQTT_STAGE_GAP_MS;
+            cloud_next_mqtt_try_ms = cloud_mqtt_stage_not_before_ms;
+            Serial.printf_P(PSTR("[TLS] TCP preconnect OK in %lu ms -> TLS stage next loop\n"),
+                            (unsigned long)mqtt_tcp_preconnect_last_duration_ms);
+            return;
+        }
+
+        if (!tlsClientStatic.tcpConnectedOnly()) {
+            cloud_tcp_stage_ready = false;
+            cloudMqttConnectFailure("tcp-lost-before-tls");
+            Serial.println(F("end mqttcon (TCP lost before TLS stage)"));
+            return;
+        }
+
+                                                                          
+                                                                             
+                                                                             
+                                                                   
+        {
+            const uint32_t preTlsHeap = ESP.getFreeHeap();
+            const uint32_t preTlsBlock = ESP.getMaxFreeBlockSize();
+            tls_admission_last_heap = preTlsHeap;
+            tls_admission_last_block = preTlsBlock;
+            if (preTlsHeap < SAR_TLS_ADMISSION_MIN_HEAP ||
+                preTlsBlock < SAR_TLS_ADMISSION_MIN_BLOCK) {
+                const uint32_t nowAdmission = millis();
+                tls_admission_blocked_count++;
+                tls_admission_last_blocked_ms = nowAdmission;
+                if (tls_admission_blocked_since_ms == 0)
+                    tls_admission_blocked_since_ms = nowAdmission;
+
+                                                                              
+                                                                        
+                cloudTlsStopBounded(false, "pre-tls-admission");
+                yield(); delay(0);
+
+                const uint32_t reclaimedHeap = ESP.getFreeHeap();
+                const uint32_t reclaimedBlock = ESP.getMaxFreeBlockSize();
+                tls_admission_last_heap = reclaimedHeap;
+                tls_admission_last_block = reclaimedBlock;
+
+                const uint32_t blockedAge =
+                    (uint32_t)(nowAdmission - tls_admission_blocked_since_ms);
+                if (blockedAge >= SAR_TLS_ADMISSION_RECOVERY_MS) {
+                    tls_admission_recovery_restarts++;
+                    String reason = String(F("TLS_ADMISSION_STUCK_PREHANDSHAKE fh=")) +
+                                    reclaimedHeap + F(" mb=") + reclaimedBlock +
+                                    F(" ageMs=") + blockedAge +
+                                    F(" blocks=") + tls_admission_blocked_count;
+                    requestRestart(reason.c_str());
+                    return;
+                }
+
+                cloud_next_mqtt_try_ms = nowAdmission + SAR_TLS_ADMISSION_RETRY_MS;
+                Serial.printf_P(PSTR("[TLS] pre-handshake admission blocked heap=%u block=%u -> retry %lu ms\n"),
+                                reclaimedHeap, reclaimedBlock,
+                                (unsigned long)SAR_TLS_ADMISSION_RETRY_MS);
+                return;
+            }
+        }
+
+                                                                             
+                                                                          
+        tlsClient->setX509Time(time(nullptr));
+        tlsClient->setTimeout(SAR_MQTT_TLS_CONNECT_TIMEOUT_MS);
+        mqtt_tls_timeout_reapply_count++;
+
+        mqtt_tls_preconnect_attempt_count++;
+        mqtt_tls_preconnect_heap_before = ESP.getFreeHeap();
+        mqtt_tls_preconnect_block_before = ESP.getMaxFreeBlockSize();
+        const uint32_t tlsStartedMs = millis();
+
+        pause_cloud_tasks_only(true);
+        yield(); delay(0);
+        const bool tlsOk = tlsClientStatic.startTlsOnly(SAR_CLOUD_HOST, SAR_MQTT_TLS_CONNECT_TIMEOUT_MS);
+        pause_cloud_tasks_only(false);
+        yield(); delay(0);
+        cloud_tcp_stage_ready = false;
+
+        mqtt_tls_preconnect_last_duration_ms = (uint32_t)(millis() - tlsStartedMs);
+        if (mqtt_tls_preconnect_last_duration_ms > mqtt_tls_preconnect_max_duration_ms)
+            mqtt_tls_preconnect_max_duration_ms = mqtt_tls_preconnect_last_duration_ms;
+        mqtt_tls_preconnect_heap_after = ESP.getFreeHeap();
+        mqtt_tls_preconnect_block_after = ESP.getMaxFreeBlockSize();
+        if (mqtt_tls_preconnect_last_duration_ms >= SAR_MQTT_SLOW_CONNECT_MS) mqtt_tls_preconnect_slow_count++;
+        if (mqtt_tls_preconnect_last_duration_ms >= 4000UL) mqtt_tls_preconnect_over4s_count++;
+
+        if (!tlsOk) {
+            mqtt_tls_preconnect_fail_count++;
+            cloudMqttConnectFailure("tls-handshake");
+            Serial.println(F("end mqttcon (TLS stage failed)"));
+            return;
+        }
+
+        mqtt_tls_preconnect_success_count++;
+        tlsClient->setTimeout(SAR_MQTT_TLS_RUNTIME_TIMEOUT_MS);
+        mqtt_tls_timeout_reapply_count++;
+        cloud_mqtt_stage_not_before_ms = millis() + SAR_MQTT_STAGE_GAP_MS;
+        cloud_next_mqtt_try_ms = cloud_mqtt_stage_not_before_ms;
+        Serial.printf_P(PSTR("[TLS] handshake OK in %lu ms -> MQTT stage next loop\n"),
+                        (unsigned long)mqtt_tls_preconnect_last_duration_ms);
+        return;
+    }
+
+                                                                                
+                                                             
+    if (!mqttCloudMode || !cloud_mqtt_attempt_in_progress) {
+        mqtt_connect_attempt_count++;
+        if (mqttCloudMode) cloud_mqtt_attempt_in_progress = true;
+    }
+    mqtt_last_connect_heap_before = ESP.getFreeHeap();
+    mqtt_last_connect_block_before = ESP.getMaxFreeBlockSize();
+    const uint32_t mqttConnectStartedMs = millis();
+
+                                                            
+                                                                         
+    if (mqttCloudMode && tlsClient) tlsClient->setX509Time(time(nullptr));
 #endif
 
-    
-    
-    
+                                                 
+                                                                                                                          
+#if defined(ESP8266)
+    if (mqttCloudMode && tlsClient) {
+                                                                              
+                                                                                
+                                                                             
+        if (!tlsClient->connected()) {
+            cloudMqttConnectFailure("tls-lost-before-mqtt");
+            Serial.println(F("end mqttcon (TLS lost before MQTT stage)"));
+            return;
+        }
+                                                                          
+                                                                              
+                                                                                
+        tlsClient->setTimeout(SAR_MQTT_TLS_RUNTIME_TIMEOUT_MS);
+        mqtt_tls_timeout_reapply_count++;
+        mqttClient->setSocketTimeout(SAR_MQTT_CONNACK_TIMEOUT_S);
+    }
+#endif
+                                                                             
+                                                                            
     const bool doPause = mqttCloudMode;
     if (doPause) pause_cloud_tasks_only(true);
     yield(); delay(0);
 
     bool _mqtt_ok = mqttClient->connect(
-        mqttClientId.c_str(), 
-        mqttUsername.c_str(), 
-        mqttPassword.c_str(), 
-        (String(mqttBaseTopic) + F("/Status")).c_str(), 
-        0,    
-        true, 
-        "Dead" 
+        mqttClientId.c_str(),             
+        mqttUsername.c_str(),                       
+        mqttPassword.c_str(),                       
+        (String(mqttBaseTopic) + F("/Status")).c_str(),             
+        0,              
+        true,              
+        "Dead"               
     );
 
     
     g_mqtt_last_connect_ok = _mqtt_ok;
 if (doPause) pause_cloud_tasks_only(false);
     yield(); delay(0);
+#if defined(ESP8266)
+    mqtt_last_connect_duration_ms = (uint32_t)(millis() - mqttConnectStartedMs);
+    mqtt_last_connect_heap_after = ESP.getFreeHeap();
+    mqtt_last_connect_block_after = ESP.getMaxFreeBlockSize();
+    if (mqttCloudMode && mqtt_last_connect_duration_ms >= SAR_MQTT_SLOW_CONNECT_MS) mqtt_slow_connect_count++;
+    if (mqttCloudMode && mqtt_last_connect_duration_ms >= 5000UL) mqtt_over_5s_connect_count++;
+#endif
 
     if (_mqtt_ok)
     {
-        
+                                         
         mqtt_connect_count++;
 #if defined(ESP8266)
         mqtt_last_connected_ms = millis();
         mqtt_last_connect_success_ms_diag = mqtt_last_connected_ms;
         mqtt_connect_success_count++;
         mqtt_fail_streak = 0;
+        if (mqttCloudMode) {
+            cloud_next_mqtt_try_ms = 0;
+            tls_admission_blocked_since_ms = 0;
+            cloud_mqtt_attempt_in_progress = false;
+            cloud_mqtt_stage_not_before_ms = 0;
+        }
 #endif
 
 if (mqttCloudMode && !SAR_CLOUD_V2_ALWAYS_ON)
@@ -6641,17 +7963,21 @@ if (mqttCloudMode && !SAR_CLOUD_V2_ALWAYS_ON)
 }
 
 
+
+                                                                       
+                                                                                           
 if (!mqttCloudMode)
 {
 }
 
 
-        
 
         
-        
-const bool retainIdentity = !mqttCloudMode;   
-const bool retainStatus   = true;            
+
+                                                                                                                                    
+                                                                                                                                
+const bool retainIdentity = !mqttCloudMode;                                
+const bool retainStatus   = true;                                                                
 
 if (mqttClient) {
     if (!mqttPublishChecked(String(mqttBaseTopic) + F("/Status"), "Alive", retainStatus)) return;
@@ -6660,12 +7986,12 @@ if (mqttClient) {
     mqttServiceTick();
 }
 
-        publishPairingHash();   
+        publishPairingHash();                    
         yield(); delay(0);
         if (mqttClient) mqttClient->loop();
 
 
-        
+                                                               
         if (mqttClient) {
             mqttClient->subscribe((String(mqttBaseTopic) + F("/command")).c_str());
             mqttServiceTick();
@@ -6674,8 +8000,8 @@ if (mqttClient) {
             mqttClient->subscribe((String(mqttBaseTopic) + F("/set_config")).c_str());
             mqttServiceTick();
 
-            
-            
+                                                                               
+                                                                    
             if (mqttCloudMode) {
                 mqttClient->subscribe((String(mqttBaseTopic) + F("/smartschedule/set")).c_str());
                 mqttServiceTick();
@@ -6694,8 +8020,8 @@ if (mqttClient) {
                 mqttClient->subscribe((String(mqttBaseTopic) + F("/request_state")).c_str());
                 mqttServiceTick();
 
-                
-                
+                                                                            
+                                                                             
                 cloud_v2_publish_telemetry_pending = true;
                 cloud_v2_publish_times_pending = true;
                 cloud_v2_publish_config_pending = true;
@@ -6705,16 +8031,16 @@ if (mqttClient) {
         }
 
 #ifdef ESP8266
-    
-    
+                                                                                    
+                                                                                    
     if (!mqttCloudMode)
     {
         armCustomHaDiscovery(1500UL);
         Serial.println(F("Custom HA discovery armed"));
 
-        
-        
-        
+                                                                 
+                                                                                
+                                                                                       
         uint32_t telemetryIntervalMs = (uint32_t)mqttTelemetryInterval * 1000UL;
         if (telemetryIntervalMs < 60000UL) telemetryIntervalMs = 60000UL;
         mqtt_telemetry_enabled = true;
@@ -6722,7 +8048,7 @@ if (mqttClient) {
     }
     else
     {
-        
+                                          
         mqtt_telemetry_enabled = false;
         mqtt_next_telemetry_ms = 0;
     }
@@ -6738,13 +8064,20 @@ if (mqttClient) {
         Serial.print(F("MQTT connect FAILED, state="));
         Serial.println(mqttClient ? mqttClient->state() : 999);
 #if defined(ESP8266)
-        mqtt_connect_fail_count++;
-        if (mqtt_fail_streak < 250) mqtt_fail_streak++;
+        if (mqttCloudMode) {
+                                                                                 
+                                                                              
+                                                                               
+            cloudMqttConnectFailure("mqtt-handshake");
+        } else {
+            mqtt_connect_fail_count++;
+            if (mqtt_fail_streak < 250) mqtt_fail_streak++;
+        }
 #endif
 
-        
-        
-        
+                                                                    
+                                                                           
+                                                                      
     }
 
     Serial.println(F("end mqttcon"));
@@ -6826,20 +8159,20 @@ void setTemperatureFromSensor()
     { 
             tempSensors->requestTemperatures(); 
             float temperatureC = tempSensors->getTempCByIndex(0);
-            
-            
-            
-            
-            
+                                                                  
+                                         
+                                   
+                                         
+                                   
 
-            
+                               
             if(temperatureC >= -20.0)
             {
                 bwc->setAmbientTemperature(temperatureC, true);
             }
     }
 
-    
+                                                     
     if (mqtt_telemetry_enabled && mqttClient && mqttClient->connected()) {
         if (millis() >= mqtt_next_telemetry_ms) {
             uint32_t telemetryIntervalMs = (uint32_t)mqttTelemetryInterval * 1000UL;

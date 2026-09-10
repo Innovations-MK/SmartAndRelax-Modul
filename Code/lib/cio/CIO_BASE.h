@@ -37,6 +37,15 @@ class CIO
         int _button_que_len = 0;  //length of buttonQ
         uint32_t good_packets_count = 0;
         uint32_t bad_packets_count = 0;
+        // 6-wire target-temperature capture diagnostics. These remain zero on
+        // 4-wire models. The target value on 6-wire pumps is not a dedicated
+        // protocol field; it must be inferred from the digits shown after
+        // UP/DOWN. Keeping the timing here also makes /diag useful without RTTI.
+        uint32_t target_capture_last_button_ms = 0;
+        uint32_t target_capture_arm_count = 0;
+        uint32_t target_capture_accept_count = 0;
+        uint8_t target_capture_last_value = 0;
+        uint32_t target_capture_last_value_ms = 0;
         std::vector<uint8_t> _raw_payload_to_cio = {0,0,0,0,0,0,0,0,0,0,0};
         int write_msg_count = 0;
     

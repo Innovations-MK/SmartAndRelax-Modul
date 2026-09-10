@@ -13,7 +13,7 @@ The complete license text is available in the `LICENSE` file.
 
 The source code for SmartAndRelax is provided in this repository.
 
-This source release is **4.0.0**. Use release archives and Git tags to retain this version.
+This source release is **4.0.1**. Earlier versions are available through their corresponding release archives and Git tags.
 
 For release-specific changes and dates, see `CHANGELOG.md`, the Git history and the corresponding GitHub releases. Additional copyright and attribution information is available in `NOTICE.md`.
 
@@ -26,6 +26,8 @@ cd Code
 pio run -e d1_mini_pro
 pio run -e d1_mini_pro -t buildfs
 ```
+
+The PlatformIO configuration invokes the included build scripts. The additional build helper introduced in 4.0.1 is `Code/patch_bearssl_timeout.py`.
 
 To install a self-built image via USB, select the correct board and serial port. The standard PlatformIO targets are:
 

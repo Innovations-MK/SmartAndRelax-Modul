@@ -86,7 +86,7 @@ bool sendWSFlag = false;
 Client *aWifiClient = nullptr;
 #if defined(ESP8266)
 #include <WiFiClientSecureBearSSL.h>
-extern BearSSL::WiFiClientSecure *tlsClient;
+extern BearSSL::WiFiClientSecureCtx *tlsClient;
 extern BearSSL::X509List *tlsCa;
 #endif
 

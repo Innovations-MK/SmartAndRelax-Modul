@@ -1,5 +1,6 @@
 #include "CIO_TYPE1.h"
 #include "ports.h"
+#include <string.h>
 
 CIO_6_TYPE1 *pointerToClassCIO61;
 
@@ -64,33 +65,67 @@ void CIO_6_TYPE1::updateStates()
 
     //_new_packet_available is true when a data packet has arrived from cio
     if(!_new_packet_available) return;
+
+    // Snapshot the ISR-owned packet atomically before doing any decoding.
+    // _payload, _brightness and _packet_error are written from the clock/CS
+    // interrupt handlers. Reading them directly with interrupts enabled can mix
+    // bytes from two consecutive CIO frames. That race is especially harmful
+    // for the short target-temperature display after UP/DOWN because a mixed
+    // digit frame may simply be rejected while the physical pump has already
+    // accepted the new target.
+    noInterrupts();
     _new_packet_available = false;
-    if(_packet_error)
+    const bool local_packet_error = _packet_error;
+    _packet_error = false;
+    uint8_t local_payload[11];
+    memcpy(local_payload, (const void *)_payload, sizeof(local_payload));
+    const uint8_t local_brightness = _brightness;
+    interrupts();
+
+    if(local_packet_error)
     {
-        _packet_error = false;
+        bad_packets_count++;
         return;
     }
-    static uint32_t buttonReleaseTime;
-    enum Readmode: int {readtemperature, uncertain, readtarget};
-    static Readmode capturePhase = readtemperature;
+
+    const uint32_t targetCaptureAge = _targetCaptureAgeMs();
+
+    // IMPORTANT: target-temperature fast path.
+    //
+    // Type1 historically requires two identical complete CIO frames before a
+    // frame is registered. That is useful as a general deglitch filter, but it
+    // is unreliable for the short/blinking target display after UP/DOWN. A
+    // slower 4.x main loop can see only one copy of a valid "38" frame and then
+    // the next blink/frame, so the target never reaches cio_states even though
+    // the physical display visibly changed. While a real UP/DOWN command is in
+    // its capture window, decode only the three numeric digits immediately.
+    // All other pump states still keep the original two-identical-frame guard.
+    if(targetCaptureAge <= TARGET_CAPTURE_MS)
+    {
+        const char c1 = _getChar(local_payload[DGT1_IDX]);
+        const char c2 = _getChar(local_payload[DGT2_IDX]);
+        const char c3 = _getChar(local_payload[DGT3_IDX]);
+        const int targetCandidate = _parseDisplayNumber(c1, c2, c3);
+        _acceptTargetValue(targetCandidate);
+    }
 
     //require two consecutive messages to be equal before registering
     static uint8_t prev_checksum = 0;
     uint8_t checksum = 0;
     for(int i = 0; i < 11; i++){
-        checksum += _payload[i];
+        checksum += local_payload[i];
     }
     if(checksum != prev_checksum) {
         prev_checksum = checksum;
         return;
     }
 
-    //copy private array to public array
-    for(unsigned int i = 0; i < sizeof(_payload); i++){
-        _raw_payload_from_cio[i] = _payload[i];
+    //copy the coherent local snapshot to the public array
+    for(unsigned int i = 0; i < sizeof(local_payload); i++){
+        _raw_payload_from_cio[i] = local_payload[i];
     }
     good_packets_count++;
-    brightness = _brightness & 7; //extract only the brightness bits (0-7)
+    brightness = local_brightness & 7; //extract only the brightness bits (0-7)
     cio_states.locked = (_raw_payload_from_cio[LCK_IDX] & (1 << LCK_BIT)) > 0;
     cio_states.power = (_raw_payload_from_cio[PWR_IDX] & (1 << PWR_BIT)) > 0;
     /*If both leds are out, don't change (When TIMER is pressed)*/
@@ -107,9 +142,9 @@ void CIO_6_TYPE1::updateStates()
     cio_states.char1 = (uint8_t)_getChar(_raw_payload_from_cio[DGT1_IDX]);
     cio_states.char2 = (uint8_t)_getChar(_raw_payload_from_cio[DGT2_IDX]);
     cio_states.char3 = (uint8_t)_getChar(_raw_payload_from_cio[DGT3_IDX]);
-    if(getHasjets()) 
+    if(getHasjets())
         cio_states.jets = (_raw_payload_from_cio[HJT_IDX] & (1 << HJT_BIT)) > 0;
-    else 
+    else
         cio_states.jets = 0;
 
     //Determine if display is showing target temp or actual temp or anything else.
@@ -123,42 +158,35 @@ void CIO_6_TYPE1::updateStates()
         errornumber += (char)cio_states.char3;
         cio_states.error = (uint8_t)(errornumber.toInt());
         return;
-    } 
+    }
     if(cio_states.char3 == 'H' || cio_states.char3 == ' ') return;
 
     /* Reset error state */
     cio_states.error = 0;
 
-    //capture TARGET after UP/DOWN has been pressed...
-    if ((_button_code == getButtonCode(UP)) || (_button_code == getButtonCode(DOWN)))
-    {
-        buttonReleaseTime = millis(); //updated as long as buttons are pressed
-        if(cio_states.power && !cio_states.locked) capturePhase = readtarget;
-    }
+    const int parsedValue = _parseDisplayNumber((char)cio_states.char1,
+                                                (char)cio_states.char2,
+                                                (char)cio_states.char3);
 
-    //Stop expecting target temp after timeout
-    if((millis()-buttonReleaseTime) > 2000) capturePhase = uncertain;
-    if((millis()-buttonReleaseTime) > 6000) capturePhase = readtemperature;
-    //convert text on display to a value if the chars are recognized
-    String tempstring = String((char)cio_states.char1)+String((char)cio_states.char2)+String((char)cio_states.char3);
-    uint8_t parsedValue = tempstring.toInt();
-    //capture target temperature only if showing plausible values (not blank screen while blinking)
-    if( (capturePhase == readtarget) && (parsedValue > 19) ) 
+                                                                          
+                                                                                
+                                                                   
+    if(targetCaptureAge <= TARGET_CAPTURE_MS)
     {
-        cio_states.target = parsedValue;
+        _acceptTargetValue(parsedValue);
     }
-    //wait 6 seconds after UP/DOWN is released to be sure that actual temp is shown
-    if(capturePhase == readtemperature)
+    else if(targetCaptureAge > TARGET_UNCERTAIN_MS)
     {
-        if(cio_states.temperature != parsedValue)
-        {
-        cio_states.temperature = parsedValue;
-        }
+        // After the original six-second guard period the display is again
+        // considered the measured water temperature.
+        if(parsedValue >= 0 && parsedValue <= 110 && cio_states.temperature != parsedValue)
+            cio_states.temperature = (uint8_t)parsedValue;
     }
+    // Between 2.2 s and 6 s deliberately update neither target nor measured
+    // temperature, preserving the old protection against the target screen.
 
     return;
 }
-
 
 /*End Of Packet.*/
 /*Todo: Copy Type2 method which has a more elegant solution. If possible, move these methods to parent class CIO_6*/

@@ -67,9 +67,7 @@ void CIO_6_TYPE2::updateStates()
     //     _packet_error = false;
     //     return cio_states;
     // }
-    static uint32_t buttonReleaseTime;
-    enum Readmode: int {readtemperature, uncertain, readtarget};
-    static Readmode capturePhase = readtemperature;
+    const uint32_t targetCaptureAge = _targetCaptureAgeMs();
 
     // //require two consecutive messages to be equal before registering
     // static uint8_t prev_checksum = 0;
@@ -127,31 +125,21 @@ void CIO_6_TYPE2::updateStates()
     /* Reset error state */
     cio_states.error = 0;
 
-    //capture TARGET after UP/DOWN has been pressed...
-    if ((_button_code == getButtonCode(UP)) || (_button_code == getButtonCode(DOWN)))
-    {
-        buttonReleaseTime = millis(); //updated as long as buttons are pressed
-        if(cio_states.power && !cio_states.locked) capturePhase = readtarget;
-    }
+    const int parsedValue = _parseDisplayNumber((char)cio_states.char1,
+                                                (char)cio_states.char2,
+                                                (char)cio_states.char3);
 
-    //Stop expecting target temp after timeout
-    if((millis()-buttonReleaseTime) > 2000) capturePhase = uncertain;
-    if((millis()-buttonReleaseTime) > 6000) capturePhase = readtemperature;
-    //convert text on display to a value if the chars are recognized
-    String tempstring = String((char)cio_states.char1)+String((char)cio_states.char2)+String((char)cio_states.char3);
-    uint8_t parsedValue = tempstring.toInt();
-    //capture target temperature only if showing plausible values (not blank screen while blinking)
-    if( (capturePhase == readtarget) && (parsedValue > 19) ) 
+    // Same robust capture timing as Type1: the window is armed when UP/DOWN
+    // is actually sent to the pump and therefore cannot be missed merely
+    // because the main loop was delayed.
+    if(targetCaptureAge <= TARGET_CAPTURE_MS)
     {
-        cio_states.target = parsedValue;
+        _acceptTargetValue(parsedValue);
     }
-    //wait 6 seconds after UP/DOWN is released to be sure that actual temp is shown
-    if(capturePhase == readtemperature)
+    else if(targetCaptureAge > TARGET_UNCERTAIN_MS)
     {
-        if(cio_states.temperature != parsedValue)
-        {
-        cio_states.temperature = parsedValue;
-        }
+        if(parsedValue >= 0 && parsedValue <= 110 && cio_states.temperature != parsedValue)
+            cio_states.temperature = (uint8_t)parsedValue;
     }
 
     return;
